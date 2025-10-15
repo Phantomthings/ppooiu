@@ -204,7 +204,26 @@ def _ensure_reclassification_history_table(conn) -> None:
     if dialect == "mysql":
         create_stmt = text(
             """
-@@ -214,4569 +215,4475 @@ def _ensure_reclassification_history_table(conn) -> None:
+            CREATE TABLE IF NOT EXISTS dispo_reclassements_historique (
+                id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+                table_name VARCHAR(128) NOT NULL,
+                bloc_id BIGINT UNSIGNED NOT NULL,
+                ancien_est_disponible INTEGER NOT NULL,
+                nouvel_est_disponible INTEGER NOT NULL,
+                changed_by VARCHAR(100) DEFAULT NULL,
+                commentaire TEXT DEFAULT NULL,
+                changed_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (id),
+                INDEX idx_dispo_reclassement_table_bloc (table_name, bloc_id, changed_at)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+            """
+        )
+    else:
+        create_stmt = text(
+            """
+            CREATE TABLE IF NOT EXISTS dispo_reclassements_historique (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                table_name VARCHAR(128) NOT NULL,
                 bloc_id BIGINT NOT NULL,
                 ancien_est_disponible INTEGER NOT NULL,
                 nouvel_est_disponible INTEGER NOT NULL,
@@ -563,7 +582,7 @@ def render_inline_delete_table(
                 if success:#k
                     st.success(success_message.format(**message_context))#k
                     invalidate_cache()#k
-                    st.experimental_rerun()#k
+                    st.rerun()#k
                 else:#k
                     st.error(error_message.format(**message_context))#k
 #k
