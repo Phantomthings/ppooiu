@@ -42,3 +42,18 @@ CREATE TABLE IF NOT EXISTS `dispo_blocs_batt` (
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
   COMMENT='Blocs consolidés BATT (DC1, DC2) issus d''Influx';
 
+
+CREATE TABLE IF NOT EXISTS `dispo_reclassements_historique` (
+  `id` BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+  `table_name` VARCHAR(128) NOT NULL,
+  `bloc_id` BIGINT UNSIGNED NOT NULL,
+  `ancien_est_disponible` TINYINT NOT NULL,
+  `nouvel_est_disponible` TINYINT NOT NULL,
+  `changed_by` VARCHAR(100) DEFAULT NULL,
+  `commentaire` TEXT DEFAULT NULL,
+  `changed_at` TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  PRIMARY KEY (`id`),
+  KEY `idx_table_bloc` (`table_name`,`bloc_id`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+  COMMENT='Historisation des reclassements manuels sur les blocs de disponibilité';
+

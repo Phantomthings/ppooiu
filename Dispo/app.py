@@ -14,6 +14,25 @@ import plotly.graph_objects as go
 import streamlit as st
 from sqlalchemy import create_engine, text
 from sqlalchemy.exc import SQLAlchemyError
+
+
+class ReclassificationError(RuntimeError):
+    """Raised when a reclassification operation cannot be performed."""
+
+
+@dataclass
+class ReclassificationResult:
+    """Represents the outcome of a reclassification operation."""
+
+    table_name: str
+    block_id: int
+    previous_status: int
+    new_status: int
+    changed_by: Optional[str]
+    comment: Optional[str]
+
+
+_TABLE_NAME_PATTERN = re.compile(r"^[A-Za-z0-9_]+$")
 from Projects import mapping_sites
 from Binaire import get_equip_config, translate_ic_pc
 
@@ -163,6 +182,186 @@ def execute_write(query: str, params: Optional[Dict] = None) -> bool:
         logger.error(f"Erreur inattendue lors de l'écriture: {e}")
         st.error(f"❌ Erreur inattendue: {str(e)}")
         return False
+
+
+def _ensure_reclassification_history_table(conn) -> None:
+    """Create the history table if it does not already exist."""
+
+    dialect = conn.dialect.name
+    if dialect == "mysql":
+        create_stmt = text(
+            """
+            CREATE TABLE IF NOT EXISTS dispo_reclassements_historique (
+                id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+                table_name VARCHAR(128) NOT NULL,
+                bloc_id BIGINT UNSIGNED NOT NULL,
+                ancien_est_disponible TINYINT NOT NULL,
+                nouvel_est_disponible TINYINT NOT NULL,
+                changed_by VARCHAR(100) DEFAULT NULL,
+                commentaire TEXT DEFAULT NULL,
+                changed_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (id),
+                KEY idx_table_bloc (table_name, bloc_id)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+            """
+        )
+    else:
+        create_stmt = text(
+            """
+            CREATE TABLE IF NOT EXISTS dispo_reclassements_historique (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                table_name VARCHAR(128) NOT NULL,
+                bloc_id BIGINT NOT NULL,
+                ancien_est_disponible INTEGER NOT NULL,
+                nouvel_est_disponible INTEGER NOT NULL,
+                changed_by VARCHAR(100) DEFAULT NULL,
+                commentaire TEXT DEFAULT NULL,
+                changed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+            """
+        )
+
+    conn.execute(create_stmt)
+
+
+def _fetch_block_status(conn, table_name: str, block_id: int) -> int:
+    """Return the current est_disponible value for the block."""
+
+    select_stmt = text(
+        f"""
+        SELECT est_disponible
+        FROM `{table_name}`
+        WHERE id = :block_id
+        """
+    )
+    row = conn.execute(select_stmt, {"block_id": block_id}).mappings().first()
+    if row is None:
+        raise ReclassificationError(
+            f"Bloc {block_id} introuvable dans la table {table_name}."
+        )
+
+    try:
+        return int(row["est_disponible"])
+    except (TypeError, ValueError) as exc:
+        raise ReclassificationError(
+            f"Valeur 'est_disponible' invalide pour le bloc {block_id}."
+        ) from exc
+
+
+def _validate_reclassification_transition(current_status: int, new_status: int) -> None:
+    """Validate the requested state transition according to business rules."""
+
+    if current_status == 1:
+        raise ReclassificationError(
+            "Les blocs déjà disponibles ne peuvent pas être reclassés."
+        )
+
+    if current_status == 0 and new_status != 1:
+        raise ReclassificationError(
+            "Un bloc indisponible exclu manuellement ne peut être reclassé qu'en disponible."
+        )
+
+    if current_status == -1 and new_status in (0, 1):
+        return
+
+    if current_status == 0 and new_status == 1:
+        return
+
+    raise ReclassificationError(
+        "Transition de statut invalide pour le bloc sélectionné."
+    )
+
+
+def _is_valid_table_name(table_name: str) -> bool:
+    return bool(_TABLE_NAME_PATTERN.match(table_name))
+
+
+def reclassify_block(
+    table_name: str,
+    block_id: int,
+    new_status: int,
+    *,
+    user: Optional[str] = None,
+    comment: Optional[str] = None,
+) -> ReclassificationResult:
+    """Apply business rules and persist the reclassification in the database."""
+
+    if new_status not in (0, 1):
+        raise ReclassificationError(
+            "Le nouvel état doit être 0 (indisponible) ou 1 (disponible)."
+        )
+
+    if not _is_valid_table_name(table_name):
+        raise ReclassificationError(
+            "Nom de table invalide : uniquement lettres, chiffres et underscores autorisés."
+        )
+
+    engine = get_engine()
+
+    current_status: Optional[int] = None
+
+    try:
+        with engine.begin() as conn:
+            _ensure_reclassification_history_table(conn)
+            current_status = _fetch_block_status(conn, table_name, block_id)
+            _validate_reclassification_transition(current_status, new_status)
+
+            update_stmt = text(
+                f"""
+                UPDATE `{table_name}`
+                SET est_disponible = :new_status
+                WHERE id = :block_id
+                """
+            )
+            result = conn.execute(
+                update_stmt, {"new_status": new_status, "block_id": block_id}
+            )
+            if result.rowcount == 0:
+                raise ReclassificationError(
+                    f"Aucune ligne mise à jour pour le bloc {block_id} dans {table_name}."
+                )
+
+            history_stmt = text(
+                """
+                INSERT INTO dispo_reclassements_historique
+                    (table_name, bloc_id, ancien_est_disponible,
+                     nouvel_est_disponible, changed_by, commentaire)
+                VALUES
+                    (:table_name, :bloc_id, :old_status, :new_status,
+                     :user, :comment)
+                """
+            )
+            conn.execute(
+                history_stmt,
+                {
+                    "table_name": table_name,
+                    "bloc_id": block_id,
+                    "old_status": current_status,
+                    "new_status": new_status,
+                    "user": user,
+                    "comment": comment,
+                },
+            )
+    except SQLAlchemyError as exc:
+        raise ReclassificationError(
+            f"Erreur lors du reclassement du bloc {block_id} dans {table_name}: {exc}"
+        ) from exc
+
+    invalidate_cache()
+
+    if current_status is None:
+        raise ReclassificationError(
+            "Impossible de déterminer l'état actuel du bloc sélectionné."
+        )
+
+    return ReclassificationResult(
+        table_name=table_name,
+        block_id=block_id,
+        previous_status=current_status,
+        new_status=new_status,
+        changed_by=user,
+        comment=comment,
+    )
 
 
 def delete_annotation(annotation_id: int) -> bool:
@@ -330,7 +529,7 @@ def _load_blocks_equipment(site: str, equip: str, start_dt: datetime, end_dt: da
             ORDER BY date_debut
         """
         df = execute_query(q_view, params)
-        if not df.empty:
+        if not df.empty and {"bloc_id", "source_table"}.issubset(df.columns):
             return _normalize_blocks_df(df)
     except DatabaseError:
         pass
@@ -346,16 +545,19 @@ def _load_blocks_equipment(site: str, equip: str, start_dt: datetime, end_dt: da
     ),
     base AS (
         SELECT
+        bloc_id, source_table,
         site, equipement_id, type_equipement, date_debut, date_fin,
         est_disponible, cause, raw_point_count, processed_at, batch_id, hash_signature
         FROM ac
         UNION ALL
         SELECT
+        bloc_id, source_table,
         site, equipement_id, type_equipement, date_debut, date_fin,
         est_disponible, cause, raw_point_count, processed_at, batch_id, hash_signature
         FROM batt
     )
     SELECT
+    b.bloc_id, b.source_table,
     b.site, b.equipement_id, b.type_equipement, b.date_debut, b.date_fin,
     b.est_disponible, b.cause, b.raw_point_count, b.processed_at, b.batch_id, b.hash_signature,
     TIMESTAMPDIFF(MINUTE, b.date_debut, b.date_fin) AS duration_minutes,
@@ -389,6 +591,8 @@ def _load_blocks_pdc(site: str, equip: str, start_dt: datetime, end_dt: datetime
         {union_sql}
     )
     SELECT
+      p.bloc_id,
+      p.source_table,
       p.site,
       p.equipement_id,
       p.type_equipement,
@@ -467,16 +671,19 @@ def _load_filtered_blocks_equipment(start_dt: datetime, end_dt: datetime, site: 
     ),
     base AS (
         SELECT
+        bloc_id, source_table,
         site, equipement_id, type_equipement, date_debut, date_fin,
         est_disponible, cause, raw_point_count, processed_at, batch_id, hash_signature
         FROM ac
         UNION ALL
         SELECT
+        bloc_id, source_table,
         site, equipement_id, type_equipement, date_debut, date_fin,
         est_disponible, cause, raw_point_count, processed_at, batch_id, hash_signature
         FROM batt
     )
     SELECT
+    b.bloc_id, b.source_table,
     b.site, b.equipement_id, b.type_equipement, b.date_debut, b.date_fin,
     b.est_disponible, b.cause, b.raw_point_count, b.processed_at, b.batch_id, b.hash_signature,
     TIMESTAMPDIFF(MINUTE, b.date_debut, b.date_fin) AS duration_minutes,
@@ -521,6 +728,8 @@ def _load_filtered_blocks_pdc(start_dt: datetime, end_dt: datetime, site: Option
         {union_sql}
     )
     SELECT
+      p.bloc_id,
+      p.source_table,
       p.site,
       p.equipement_id,
       p.type_equipement,
@@ -677,7 +886,9 @@ def _ac_union_sql_for_site(site: str) -> str:
     df = _list_ac_tables()
     if df.empty:
         return """SELECT * FROM (
-            SELECT CAST(NULL AS CHAR) AS site,
+            SELECT CAST(NULL AS SIGNED) AS bloc_id,
+                   CAST(NULL AS CHAR) AS source_table,
+                   CAST(NULL AS CHAR) AS site,
                    CAST(NULL AS CHAR) AS equipement_id,
                    CAST(NULL AS CHAR) AS type_equipement,
                    CAST(NULL AS DATETIME) AS date_debut,
@@ -693,7 +904,9 @@ def _ac_union_sql_for_site(site: str) -> str:
     m = df[df["site_code"] == site]
     if m.empty:
         return """SELECT * FROM (
-            SELECT CAST(NULL AS CHAR) AS site,
+            SELECT CAST(NULL AS SIGNED) AS bloc_id,
+                   CAST(NULL AS CHAR) AS source_table,
+                   CAST(NULL AS CHAR) AS site,
                    CAST(NULL AS CHAR) AS equipement_id,
                    CAST(NULL AS CHAR) AS type_equipement,
                    CAST(NULL AS DATETIME) AS date_debut,
@@ -711,6 +924,8 @@ def _ac_union_sql_for_site(site: str) -> str:
         tbl = r["table_name"]
         parts.append(f"""
             SELECT
+              id AS bloc_id,
+              '{tbl}' AS source_table,
               site, equipement_id, type_equipement, date_debut, date_fin,
               est_disponible, cause, raw_point_count, processed_at, batch_id, hash_signature
             FROM `{tbl}`
@@ -725,7 +940,9 @@ def _ac_union_sql_all_sites() -> str:
     df = _list_ac_tables()
     if df.empty:
         return """SELECT * FROM (
-            SELECT CAST(NULL AS CHAR) AS site,
+            SELECT CAST(NULL AS SIGNED) AS bloc_id,
+                   CAST(NULL AS CHAR) AS source_table,
+                   CAST(NULL AS CHAR) AS site,
                    CAST(NULL AS CHAR) AS equipement_id,
                    CAST(NULL AS CHAR) AS type_equipement,
                    CAST(NULL AS DATETIME) AS date_debut,
@@ -739,6 +956,8 @@ def _ac_union_sql_all_sites() -> str:
         ) x WHERE 1=0"""
     parts = [
         f"""SELECT
+              id AS bloc_id,
+              '{tbl}' AS source_table,
               site, equipement_id, type_equipement, date_debut, date_fin,
               est_disponible, cause, raw_point_count, processed_at, batch_id, hash_signature
             FROM `{tbl}`"""
@@ -755,7 +974,9 @@ def _batt_union_sql_for_site(site: str) -> str:
     df = _list_batt_tables()
     if df.empty:
         return """SELECT * FROM (
-            SELECT CAST(NULL AS CHAR) AS site,
+            SELECT CAST(NULL AS SIGNED) AS bloc_id,
+                   CAST(NULL AS CHAR) AS source_table,
+                   CAST(NULL AS CHAR) AS site,
                    CAST(NULL AS CHAR) AS equipement_id,
                    CAST(NULL AS CHAR) AS type_equipement,
                    CAST(NULL AS DATETIME) AS date_debut,
@@ -773,13 +994,17 @@ def _batt_union_sql_for_site(site: str) -> str:
         tbl = r["table_name"]
         parts.append(f"""
             SELECT
+              id AS bloc_id,
+              '{tbl}' AS source_table,
               site, equipement_id, type_equipement, date_debut, date_fin,
               est_disponible, cause, raw_point_count, processed_at, batch_id, hash_signature
             FROM `{tbl}`
         """)
     if not parts:
         return """SELECT * FROM (
-            SELECT CAST(NULL AS CHAR) AS site,
+            SELECT CAST(NULL AS SIGNED) AS bloc_id,
+                   CAST(NULL AS CHAR) AS source_table,
+                   CAST(NULL AS CHAR) AS site,
                    CAST(NULL AS CHAR) AS equipement_id,
                    CAST(NULL AS CHAR) AS type_equipement,
                    CAST(NULL AS DATETIME) AS date_debut,
@@ -801,7 +1026,9 @@ def _batt_union_sql_all_sites() -> str:
     df = _list_batt_tables()
     if df.empty:
         return """SELECT * FROM (
-            SELECT CAST(NULL AS CHAR) AS site,
+            SELECT CAST(NULL AS SIGNED) AS bloc_id,
+                   CAST(NULL AS CHAR) AS source_table,
+                   CAST(NULL AS CHAR) AS site,
                    CAST(NULL AS CHAR) AS equipement_id,
                    CAST(NULL AS CHAR) AS type_equipement,
                    CAST(NULL AS DATETIME) AS date_debut,
@@ -815,6 +1042,8 @@ def _batt_union_sql_all_sites() -> str:
         ) x WHERE 1=0"""
     parts = [f"""
         SELECT
+          id AS bloc_id,
+          '{tbl}' AS source_table,
           site, equipement_id, type_equipement, date_debut, date_fin,
           est_disponible, cause, raw_point_count, processed_at, batch_id, hash_signature
         FROM `{tbl}`
@@ -827,7 +1056,9 @@ def _pdc_union_sql_for_site(site: str) -> str:
     df = _list_pdc_tables()
     if df.empty:
         return """SELECT * FROM (
-            SELECT CAST(NULL AS CHAR) AS site,
+            SELECT CAST(NULL AS SIGNED) AS bloc_id,
+                   CAST(NULL AS CHAR) AS source_table,
+                   CAST(NULL AS CHAR) AS site,
                    CAST(NULL AS CHAR) AS equipement_id,
                    CAST(NULL AS CHAR) AS type_equipement,
                    CAST(NULL AS DATETIME) AS date_debut,
@@ -861,6 +1092,8 @@ def _pdc_union_sql_for_site(site: str) -> str:
         tbl = row["table_name"]
         parts.append(f"""
             SELECT
+              id AS bloc_id,
+              '{tbl}' AS source_table,
               site,
               pdc_id AS equipement_id,
               type_label AS type_equipement,
@@ -898,6 +1131,8 @@ def _pdc_union_sql_all_sites() -> str:
     parts = [
         f"""
             SELECT
+              id AS bloc_id,
+              '{tbl}' AS source_table,
               site,
               pdc_id AS equipement_id,
               type_label AS type_equipement,
@@ -936,6 +1171,16 @@ def _normalize_blocks_df(df: pd.DataFrame) -> pd.DataFrame:
         else:
             if col == "is_excluded":
                 out[col] = 0
+    if "bloc_id" in out.columns:
+        out["bloc_id"] = pd.to_numeric(out["bloc_id"], errors="coerce").fillna(-1).astype(int)
+    elif "id" in out.columns:
+        out["bloc_id"] = pd.to_numeric(out["id"], errors="coerce").fillna(-1).astype(int)
+    else:
+        out["bloc_id"] = -1
+    if "source_table" in out.columns:
+        out["source_table"] = out["source_table"].fillna("").astype(str)
+    else:
+        out["source_table"] = ""
     if "is_excluded" in out.columns and "est_disponible" in out.columns:
         out.loc[out["est_disponible"] == 1, "is_excluded"] = 0
     return out.sort_values("date_debut").reset_index(drop=True)
@@ -2913,6 +3158,69 @@ def render_timeline_tab(site: Optional[str], equip: Optional[str], start_dt: dat
         selected_idx = int(selected_block_label.split(":")[0])
         selected_row = df_display.iloc[selected_idx]
         est_val = int(selected_row["est_disponible"])
+
+        bloc_id = int(selected_row.get("bloc_id", -1))
+        source_table = str(selected_row.get("source_table", "") or "")
+
+        allowed_transitions: List[Tuple[int, str]] = []
+        if est_val == -1:
+            allowed_transitions = [
+                (1, "✅ Reclasser en disponible"),
+                (0, "❌ Reclasser en indisponible"),
+            ]
+        elif est_val == 0:
+            allowed_transitions = [(1, "✅ Reclasser en disponible")]
+
+        if allowed_transitions and bloc_id > 0 and source_table:
+            st.markdown("### 🔄 Reclassement du bloc")
+            options = [opt for opt, _ in allowed_transitions]
+            labels = {opt: label for opt, label in allowed_transitions}
+
+            with st.form(f"reclass_form_{bloc_id}"):
+                new_status = st.radio(
+                    "Nouvel état",
+                    options=options,
+                    index=0,
+                    format_func=lambda value: labels.get(value, str(value)),
+                    help="Les transitions autorisées sont dictées par les règles métier."
+                )
+                operator_name = st.text_input(
+                    "Opérateur (historisation)",
+                    placeholder="ex: Jean Dupont",
+                    help="Identifiez la personne responsable de ce reclassement."
+                )
+                reclass_comment = st.text_area(
+                    "Commentaire obligatoire",
+                    placeholder="Décrivez la raison du reclassement...",
+                    help="Chaque changement doit être historisé avec un commentaire explicite."
+                )
+                submit_reclass = st.form_submit_button("🔄 Appliquer le reclassement")
+
+                if submit_reclass:
+                    comment_txt = reclass_comment.strip()
+                    if len(comment_txt) < 10:
+                        st.error("❌ Le commentaire doit contenir au moins 10 caractères.")
+                    else:
+                        try:
+                            result = reclassify_block(
+                                table_name=source_table,
+                                block_id=bloc_id,
+                                new_status=int(new_status),
+                                user=operator_name.strip() or None,
+                                comment=comment_txt,
+                            )
+                        except ReclassificationError as exc:
+                            st.error(f"❌ Reclassement impossible : {exc}")
+                        else:
+                            st.success(
+                                f"✅ Bloc {result.block_id} reclassé en {result.new_status} (table {result.table_name})."
+                            )
+                            st.balloons()
+                            st.rerun()
+        elif allowed_transitions:
+            st.warning(
+                "⚠️ Ce bloc ne peut pas être reclassé car les informations d'identification sont incomplètes."
+            )
 
         with st.form("annotation_form", clear_on_submit=True):
             st.markdown(f"**Bloc sélectionné:** {selected_row['start']} → {selected_row['end']}")
