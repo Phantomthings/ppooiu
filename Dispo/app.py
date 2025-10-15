@@ -14,6 +14,26 @@ import plotly.graph_objects as go
 import streamlit as st
 from sqlalchemy import create_engine, text
 from sqlalchemy.exc import SQLAlchemyError
+
+
+class ExclusionError(RuntimeError):
+    """Raised when an exclusion operation cannot be completed."""
+
+
+@dataclass
+class ExclusionActionResult:
+    """Represents the outcome of an exclusion related change."""
+
+    table_name: str
+    block_id: int
+    exclusion_id: int
+    previous_status: int
+    new_status: int
+    changed_by: Optional[str]
+    comment: Optional[str]
+
+
+_TABLE_NAME_PATTERN = re.compile(r"^[A-Za-z0-9_]+$")
 from Projects import mapping_sites
 from Binaire import get_equip_config, translate_ic_pc
 
@@ -163,6 +183,330 @@ def execute_write(query: str, params: Optional[Dict] = None) -> bool:
         logger.error(f"Erreur inattendue lors de l'écriture: {e}")
         st.error(f"❌ Erreur inattendue: {str(e)}")
         return False
+
+
+def _ensure_reclassification_history_table(conn) -> None:
+    """Create the history table if it does not already exist."""
+
+    dialect = conn.dialect.name
+    if dialect == "mysql":
+        create_stmt = text(
+            """
+            CREATE TABLE IF NOT EXISTS dispo_reclassements_historique (
+                id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+                table_name VARCHAR(128) NOT NULL,
+                bloc_id BIGINT UNSIGNED NOT NULL,
+                ancien_est_disponible TINYINT NOT NULL,
+                nouvel_est_disponible TINYINT NOT NULL,
+                changed_by VARCHAR(100) DEFAULT NULL,
+                commentaire TEXT DEFAULT NULL,
+                changed_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (id),
+                KEY idx_table_bloc (table_name, bloc_id)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+            """
+        )
+    else:
+        create_stmt = text(
+            """
+            CREATE TABLE IF NOT EXISTS dispo_reclassements_historique (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                table_name VARCHAR(128) NOT NULL,
+                bloc_id BIGINT NOT NULL,
+                ancien_est_disponible INTEGER NOT NULL,
+                nouvel_est_disponible INTEGER NOT NULL,
+                changed_by VARCHAR(100) DEFAULT NULL,
+                commentaire TEXT DEFAULT NULL,
+                changed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+            """
+        )
+
+    conn.execute(create_stmt)
+
+
+def _fetch_block_status(conn, table_name: str, block_id: int) -> int:
+    """Return the current est_disponible value for the block."""
+
+    select_stmt = text(
+        f"""
+        SELECT est_disponible
+        FROM `{table_name}`
+        WHERE id = :block_id
+        """
+    )
+    row = conn.execute(select_stmt, {"block_id": block_id}).mappings().first()
+    if row is None:
+        raise ExclusionError(
+            f"Bloc {block_id} introuvable dans la table {table_name}."
+        )
+
+    try:
+        return int(row["est_disponible"])
+    except (TypeError, ValueError) as exc:
+        raise ExclusionError(
+            f"Valeur 'est_disponible' invalide pour le bloc {block_id}."
+        ) from exc
+
+
+def _is_valid_table_name(table_name: str) -> bool:
+    return bool(_TABLE_NAME_PATTERN.match(table_name))
+
+
+def _ensure_exclusion_table(conn) -> None:
+    dialect = conn.dialect.name
+    if dialect == "mysql":
+        create_stmt = text(
+            """
+            CREATE TABLE IF NOT EXISTS dispo_blocs_exclusions (
+                id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+                table_name VARCHAR(128) NOT NULL,
+                bloc_id BIGINT UNSIGNED NOT NULL,
+                previous_status TINYINT NOT NULL,
+                exclusion_comment TEXT DEFAULT NULL,
+                applied_by VARCHAR(100) DEFAULT NULL,
+                applied_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                released_by VARCHAR(100) DEFAULT NULL,
+                release_comment TEXT DEFAULT NULL,
+                released_at TIMESTAMP NULL DEFAULT NULL,
+                PRIMARY KEY (id),
+                UNIQUE KEY uq_block_active (table_name, bloc_id, released_at)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+            """
+        )
+    else:
+        create_stmt = text(
+            """
+            CREATE TABLE IF NOT EXISTS dispo_blocs_exclusions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                table_name VARCHAR(128) NOT NULL,
+                bloc_id BIGINT NOT NULL,
+                previous_status INTEGER NOT NULL,
+                exclusion_comment TEXT DEFAULT NULL,
+                applied_by VARCHAR(100) DEFAULT NULL,
+                applied_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                released_by VARCHAR(100) DEFAULT NULL,
+                release_comment TEXT DEFAULT NULL,
+                released_at TIMESTAMP DEFAULT NULL
+            )
+            """
+        )
+    conn.execute(create_stmt)
+
+
+def _get_active_exclusion(conn, table_name: str, block_id: int) -> Optional[Dict[str, Any]]:
+    stmt = text(
+        """
+        SELECT id, previous_status, exclusion_comment, applied_by, applied_at
+        FROM dispo_blocs_exclusions
+        WHERE table_name = :table_name
+          AND bloc_id = :block_id
+          AND released_at IS NULL
+        FOR UPDATE
+        """
+    )
+    row = conn.execute(stmt, {"table_name": table_name, "block_id": block_id}).mappings().first()
+    return dict(row) if row else None
+
+
+def apply_block_exclusion(
+    table_name: str,
+    block_id: int,
+    *,
+    user: Optional[str] = None,
+    comment: Optional[str] = None,
+) -> ExclusionActionResult:
+    if not _is_valid_table_name(table_name):
+        raise ExclusionError("Nom de table invalide pour l'exclusion.")
+
+    engine = get_engine()
+    current_status: Optional[int] = None
+    exclusion_id: Optional[int] = None
+
+    try:
+        with engine.begin() as conn:
+            _ensure_exclusion_table(conn)
+            _ensure_reclassification_history_table(conn)
+
+            current_status = _fetch_block_status(conn, table_name, block_id)
+            if current_status == 1:
+                raise ExclusionError("Le bloc est déjà disponible, exclusion inutile.")
+
+            existing = _get_active_exclusion(conn, table_name, block_id)
+            if existing:
+                raise ExclusionError("Une exclusion active existe déjà pour ce bloc.")
+
+            update_stmt = text(
+                f"""
+                UPDATE `{table_name}`
+                SET est_disponible = 1
+                WHERE id = :block_id
+                """
+            )
+            result = conn.execute(update_stmt, {"block_id": block_id})
+            if result.rowcount == 0:
+                raise ExclusionError("Aucun bloc mis à jour lors de l'exclusion.")
+
+            insert_stmt = text(
+                """
+                INSERT INTO dispo_blocs_exclusions
+                    (table_name, bloc_id, previous_status, exclusion_comment, applied_by)
+                VALUES
+                    (:table_name, :bloc_id, :previous_status, :comment, :user)
+                """
+            )
+            res = conn.execute(
+                insert_stmt,
+                {
+                    "table_name": table_name,
+                    "bloc_id": block_id,
+                    "previous_status": current_status,
+                    "comment": comment,
+                    "user": user,
+                },
+            )
+            exclusion_id = res.lastrowid
+
+            history_stmt = text(
+                """
+                INSERT INTO dispo_reclassements_historique
+                    (table_name, bloc_id, ancien_est_disponible,
+                     nouvel_est_disponible, changed_by, commentaire)
+                VALUES
+                    (:table_name, :bloc_id, :old_status, :new_status,
+                     :user, :comment)
+                """
+            )
+            conn.execute(
+                history_stmt,
+                {
+                    "table_name": table_name,
+                    "bloc_id": block_id,
+                    "old_status": current_status,
+                    "new_status": 1,
+                    "user": user,
+                    "comment": comment,
+                },
+            )
+    except SQLAlchemyError as exc:
+        raise ExclusionError(
+            f"Erreur lors de l'exclusion du bloc {block_id} dans {table_name}: {exc}"
+        ) from exc
+
+    invalidate_cache()
+
+    if current_status is None or exclusion_id is None:
+        raise ExclusionError("Échec de la création de l'exclusion.")
+
+    return ExclusionActionResult(
+        table_name=table_name,
+        block_id=block_id,
+        exclusion_id=int(exclusion_id),
+        previous_status=current_status,
+        new_status=1,
+        changed_by=user,
+        comment=comment,
+    )
+
+
+def release_block_exclusion(
+    table_name: str,
+    block_id: int,
+    *,
+    user: Optional[str] = None,
+    comment: Optional[str] = None,
+) -> ExclusionActionResult:
+    if not _is_valid_table_name(table_name):
+        raise ExclusionError("Nom de table invalide pour l'exclusion.")
+
+    engine = get_engine()
+    active: Optional[Dict[str, Any]] = None
+    current_status: Optional[int] = None
+
+    try:
+        with engine.begin() as conn:
+            _ensure_exclusion_table(conn)
+            _ensure_reclassification_history_table(conn)
+
+            active = _get_active_exclusion(conn, table_name, block_id)
+            if not active:
+                raise ExclusionError("Aucune exclusion active à lever pour ce bloc.")
+
+            current_status = _fetch_block_status(conn, table_name, block_id)
+
+            restore_stmt = text(
+                f"""
+                UPDATE `{table_name}`
+                SET est_disponible = :previous_status
+                WHERE id = :block_id
+                """
+            )
+            conn.execute(
+                restore_stmt,
+                {
+                    "previous_status": int(active["previous_status"]),
+                    "block_id": block_id,
+                },
+            )
+
+            update_stmt = text(
+                """
+                UPDATE dispo_blocs_exclusions
+                SET released_at = CURRENT_TIMESTAMP,
+                    released_by = :user,
+                    release_comment = :comment
+                WHERE id = :exclusion_id
+                """
+            )
+            conn.execute(
+                update_stmt,
+                {
+                    "exclusion_id": active["id"],
+                    "user": user,
+                    "comment": comment,
+                },
+            )
+
+            history_stmt = text(
+                """
+                INSERT INTO dispo_reclassements_historique
+                    (table_name, bloc_id, ancien_est_disponible,
+                     nouvel_est_disponible, changed_by, commentaire)
+                VALUES
+                    (:table_name, :bloc_id, :old_status, :new_status,
+                     :user, :comment)
+                """
+            )
+            conn.execute(
+                history_stmt,
+                {
+                    "table_name": table_name,
+                    "bloc_id": block_id,
+                    "old_status": current_status,
+                    "new_status": int(active["previous_status"]),
+                    "user": user,
+                    "comment": comment,
+                },
+            )
+    except SQLAlchemyError as exc:
+        raise ExclusionError(
+            f"Erreur lors de la suppression de l'exclusion du bloc {block_id} dans {table_name}: {exc}"
+        ) from exc
+
+    invalidate_cache()
+
+    if active is None or current_status is None:
+        raise ExclusionError("Impossible de finaliser la suppression de l'exclusion.")
+
+    return ExclusionActionResult(
+        table_name=table_name,
+        block_id=block_id,
+        exclusion_id=int(active["id"]),
+        previous_status=current_status,
+        new_status=int(active["previous_status"]),
+        changed_by=user,
+        comment=comment,
+    )
 
 
 def delete_annotation(annotation_id: int) -> bool:
@@ -330,7 +674,7 @@ def _load_blocks_equipment(site: str, equip: str, start_dt: datetime, end_dt: da
             ORDER BY date_debut
         """
         df = execute_query(q_view, params)
-        if not df.empty:
+        if not df.empty and {"bloc_id", "source_table"}.issubset(df.columns):
             return _normalize_blocks_df(df)
     except DatabaseError:
         pass
@@ -346,31 +690,33 @@ def _load_blocks_equipment(site: str, equip: str, start_dt: datetime, end_dt: da
     ),
     base AS (
         SELECT
+        bloc_id, source_table,
         site, equipement_id, type_equipement, date_debut, date_fin,
         est_disponible, cause, raw_point_count, processed_at, batch_id, hash_signature
         FROM ac
         UNION ALL
         SELECT
+        bloc_id, source_table,
         site, equipement_id, type_equipement, date_debut, date_fin,
         est_disponible, cause, raw_point_count, processed_at, batch_id, hash_signature
         FROM batt
     )
     SELECT
+    b.bloc_id, b.source_table,
     b.site, b.equipement_id, b.type_equipement, b.date_debut, b.date_fin,
     b.est_disponible, b.cause, b.raw_point_count, b.processed_at, b.batch_id, b.hash_signature,
     TIMESTAMPDIFF(MINUTE, b.date_debut, b.date_fin) AS duration_minutes,
-    CASE
-        WHEN b.est_disponible <> 1 THEN CAST(EXISTS (
-            SELECT 1 FROM dispo_annotations a
-            WHERE a.actif = 1
-            AND a.type_annotation = 'exclusion'
-            AND a.site = b.site
-            AND a.equipement_id = b.equipement_id
-            AND NOT (a.date_fin <= b.date_debut OR a.date_debut >= b.date_fin)
-        ) AS UNSIGNED)
-        ELSE 0
-    END AS is_excluded
+    COALESCE(e.previous_status, b.est_disponible) AS previous_status,
+    CASE WHEN e.id IS NOT NULL THEN 1 ELSE 0 END AS is_excluded,
+    e.id AS exclusion_id,
+    e.applied_by AS exclusion_applied_by,
+    e.applied_at AS exclusion_applied_at,
+    e.exclusion_comment AS exclusion_comment
     FROM base b
+    LEFT JOIN dispo_blocs_exclusions e
+      ON e.table_name = b.source_table
+     AND e.bloc_id = b.bloc_id
+     AND e.released_at IS NULL
     WHERE b.equipement_id = :equip
     AND b.date_debut < :end
     AND b.date_fin   > :start
@@ -389,6 +735,8 @@ def _load_blocks_pdc(site: str, equip: str, start_dt: datetime, end_dt: datetime
         {union_sql}
     )
     SELECT
+      p.bloc_id,
+      p.source_table,
       p.site,
       p.equipement_id,
       p.type_equipement,
@@ -401,18 +749,17 @@ def _load_blocks_pdc(site: str, equip: str, start_dt: datetime, end_dt: datetime
       p.batch_id,
       p.hash_signature,
       TIMESTAMPDIFF(MINUTE, p.date_debut, p.date_fin) AS duration_minutes,
-      CASE
-        WHEN p.est_disponible <> 1 THEN CAST(EXISTS (
-            SELECT 1 FROM dispo_annotations a
-            WHERE a.actif = 1
-              AND a.type_annotation = 'exclusion'
-              AND a.site = p.site
-              AND a.equipement_id = p.equipement_id
-              AND NOT (a.date_fin <= p.date_debut OR a.date_debut >= p.date_fin)
-        ) AS UNSIGNED)
-        ELSE 0
-      END AS is_excluded
+      COALESCE(e.previous_status, p.est_disponible) AS previous_status,
+      CASE WHEN e.id IS NOT NULL THEN 1 ELSE 0 END AS is_excluded,
+      e.id AS exclusion_id,
+      e.applied_by AS exclusion_applied_by,
+      e.applied_at AS exclusion_applied_at,
+      e.exclusion_comment AS exclusion_comment
     FROM pdc p
+    LEFT JOIN dispo_blocs_exclusions e
+      ON e.table_name = p.source_table
+     AND e.bloc_id = p.bloc_id
+     AND e.released_at IS NULL
     WHERE p.equipement_id = :equip
       AND p.date_debut < :end
       AND p.date_fin   > :start
@@ -467,31 +814,33 @@ def _load_filtered_blocks_equipment(start_dt: datetime, end_dt: datetime, site: 
     ),
     base AS (
         SELECT
+        bloc_id, source_table,
         site, equipement_id, type_equipement, date_debut, date_fin,
         est_disponible, cause, raw_point_count, processed_at, batch_id, hash_signature
         FROM ac
         UNION ALL
         SELECT
+        bloc_id, source_table,
         site, equipement_id, type_equipement, date_debut, date_fin,
         est_disponible, cause, raw_point_count, processed_at, batch_id, hash_signature
         FROM batt
     )
     SELECT
+    b.bloc_id, b.source_table,
     b.site, b.equipement_id, b.type_equipement, b.date_debut, b.date_fin,
     b.est_disponible, b.cause, b.raw_point_count, b.processed_at, b.batch_id, b.hash_signature,
     TIMESTAMPDIFF(MINUTE, b.date_debut, b.date_fin) AS duration_minutes,
-    CASE
-        WHEN b.est_disponible <> 1 THEN CAST(EXISTS (
-            SELECT 1 FROM dispo_annotations a
-            WHERE a.actif = 1
-            AND a.type_annotation = 'exclusion'
-            AND a.site = b.site
-            AND a.equipement_id = b.equipement_id
-            AND NOT (a.date_fin <= b.date_debut OR a.date_debut >= b.date_fin)
-        ) AS UNSIGNED)
-        ELSE 0
-    END AS is_excluded
+    COALESCE(e.previous_status, b.est_disponible) AS previous_status,
+    CASE WHEN e.id IS NOT NULL THEN 1 ELSE 0 END AS is_excluded,
+    e.id AS exclusion_id,
+    e.applied_by AS exclusion_applied_by,
+    e.applied_at AS exclusion_applied_at,
+    e.exclusion_comment AS exclusion_comment
     FROM base b
+    LEFT JOIN dispo_blocs_exclusions e
+      ON e.table_name = b.source_table
+     AND e.bloc_id = b.bloc_id
+     AND e.released_at IS NULL
     WHERE b.date_debut < :end
     AND b.date_fin   > :start
     {equip_filter}
@@ -521,6 +870,8 @@ def _load_filtered_blocks_pdc(start_dt: datetime, end_dt: datetime, site: Option
         {union_sql}
     )
     SELECT
+      p.bloc_id,
+      p.source_table,
       p.site,
       p.equipement_id,
       p.type_equipement,
@@ -533,18 +884,17 @@ def _load_filtered_blocks_pdc(start_dt: datetime, end_dt: datetime, site: Option
       p.batch_id,
       p.hash_signature,
       TIMESTAMPDIFF(MINUTE, p.date_debut, p.date_fin) AS duration_minutes,
-      CASE
-        WHEN p.est_disponible <> 1 THEN CAST(EXISTS (
-            SELECT 1 FROM dispo_annotations a
-            WHERE a.actif = 1
-              AND a.type_annotation = 'exclusion'
-              AND a.site = p.site
-              AND a.equipement_id = p.equipement_id
-              AND NOT (a.date_fin <= p.date_debut OR a.date_debut >= p.date_fin)
-        ) AS UNSIGNED)
-        ELSE 0
-      END AS is_excluded
+      COALESCE(e.previous_status, p.est_disponible) AS previous_status,
+      CASE WHEN e.id IS NOT NULL THEN 1 ELSE 0 END AS is_excluded,
+      e.id AS exclusion_id,
+      e.applied_by AS exclusion_applied_by,
+      e.applied_at AS exclusion_applied_at,
+      e.exclusion_comment AS exclusion_comment
     FROM pdc p
+    LEFT JOIN dispo_blocs_exclusions e
+      ON e.table_name = p.source_table
+     AND e.bloc_id = p.bloc_id
+     AND e.released_at IS NULL
     WHERE p.date_debut < :end
       AND p.date_fin > :start
       {site_filter}
@@ -677,7 +1027,9 @@ def _ac_union_sql_for_site(site: str) -> str:
     df = _list_ac_tables()
     if df.empty:
         return """SELECT * FROM (
-            SELECT CAST(NULL AS CHAR) AS site,
+            SELECT CAST(NULL AS SIGNED) AS bloc_id,
+                   CAST(NULL AS CHAR) AS source_table,
+                   CAST(NULL AS CHAR) AS site,
                    CAST(NULL AS CHAR) AS equipement_id,
                    CAST(NULL AS CHAR) AS type_equipement,
                    CAST(NULL AS DATETIME) AS date_debut,
@@ -693,7 +1045,9 @@ def _ac_union_sql_for_site(site: str) -> str:
     m = df[df["site_code"] == site]
     if m.empty:
         return """SELECT * FROM (
-            SELECT CAST(NULL AS CHAR) AS site,
+            SELECT CAST(NULL AS SIGNED) AS bloc_id,
+                   CAST(NULL AS CHAR) AS source_table,
+                   CAST(NULL AS CHAR) AS site,
                    CAST(NULL AS CHAR) AS equipement_id,
                    CAST(NULL AS CHAR) AS type_equipement,
                    CAST(NULL AS DATETIME) AS date_debut,
@@ -711,6 +1065,8 @@ def _ac_union_sql_for_site(site: str) -> str:
         tbl = r["table_name"]
         parts.append(f"""
             SELECT
+              id AS bloc_id,
+              '{tbl}' AS source_table,
               site, equipement_id, type_equipement, date_debut, date_fin,
               est_disponible, cause, raw_point_count, processed_at, batch_id, hash_signature
             FROM `{tbl}`
@@ -725,7 +1081,9 @@ def _ac_union_sql_all_sites() -> str:
     df = _list_ac_tables()
     if df.empty:
         return """SELECT * FROM (
-            SELECT CAST(NULL AS CHAR) AS site,
+            SELECT CAST(NULL AS SIGNED) AS bloc_id,
+                   CAST(NULL AS CHAR) AS source_table,
+                   CAST(NULL AS CHAR) AS site,
                    CAST(NULL AS CHAR) AS equipement_id,
                    CAST(NULL AS CHAR) AS type_equipement,
                    CAST(NULL AS DATETIME) AS date_debut,
@@ -739,6 +1097,8 @@ def _ac_union_sql_all_sites() -> str:
         ) x WHERE 1=0"""
     parts = [
         f"""SELECT
+              id AS bloc_id,
+              '{tbl}' AS source_table,
               site, equipement_id, type_equipement, date_debut, date_fin,
               est_disponible, cause, raw_point_count, processed_at, batch_id, hash_signature
             FROM `{tbl}`"""
@@ -755,7 +1115,9 @@ def _batt_union_sql_for_site(site: str) -> str:
     df = _list_batt_tables()
     if df.empty:
         return """SELECT * FROM (
-            SELECT CAST(NULL AS CHAR) AS site,
+            SELECT CAST(NULL AS SIGNED) AS bloc_id,
+                   CAST(NULL AS CHAR) AS source_table,
+                   CAST(NULL AS CHAR) AS site,
                    CAST(NULL AS CHAR) AS equipement_id,
                    CAST(NULL AS CHAR) AS type_equipement,
                    CAST(NULL AS DATETIME) AS date_debut,
@@ -773,13 +1135,17 @@ def _batt_union_sql_for_site(site: str) -> str:
         tbl = r["table_name"]
         parts.append(f"""
             SELECT
+              id AS bloc_id,
+              '{tbl}' AS source_table,
               site, equipement_id, type_equipement, date_debut, date_fin,
               est_disponible, cause, raw_point_count, processed_at, batch_id, hash_signature
             FROM `{tbl}`
         """)
     if not parts:
         return """SELECT * FROM (
-            SELECT CAST(NULL AS CHAR) AS site,
+            SELECT CAST(NULL AS SIGNED) AS bloc_id,
+                   CAST(NULL AS CHAR) AS source_table,
+                   CAST(NULL AS CHAR) AS site,
                    CAST(NULL AS CHAR) AS equipement_id,
                    CAST(NULL AS CHAR) AS type_equipement,
                    CAST(NULL AS DATETIME) AS date_debut,
@@ -801,7 +1167,9 @@ def _batt_union_sql_all_sites() -> str:
     df = _list_batt_tables()
     if df.empty:
         return """SELECT * FROM (
-            SELECT CAST(NULL AS CHAR) AS site,
+            SELECT CAST(NULL AS SIGNED) AS bloc_id,
+                   CAST(NULL AS CHAR) AS source_table,
+                   CAST(NULL AS CHAR) AS site,
                    CAST(NULL AS CHAR) AS equipement_id,
                    CAST(NULL AS CHAR) AS type_equipement,
                    CAST(NULL AS DATETIME) AS date_debut,
@@ -815,6 +1183,8 @@ def _batt_union_sql_all_sites() -> str:
         ) x WHERE 1=0"""
     parts = [f"""
         SELECT
+          id AS bloc_id,
+          '{tbl}' AS source_table,
           site, equipement_id, type_equipement, date_debut, date_fin,
           est_disponible, cause, raw_point_count, processed_at, batch_id, hash_signature
         FROM `{tbl}`
@@ -827,7 +1197,9 @@ def _pdc_union_sql_for_site(site: str) -> str:
     df = _list_pdc_tables()
     if df.empty:
         return """SELECT * FROM (
-            SELECT CAST(NULL AS CHAR) AS site,
+            SELECT CAST(NULL AS SIGNED) AS bloc_id,
+                   CAST(NULL AS CHAR) AS source_table,
+                   CAST(NULL AS CHAR) AS site,
                    CAST(NULL AS CHAR) AS equipement_id,
                    CAST(NULL AS CHAR) AS type_equipement,
                    CAST(NULL AS DATETIME) AS date_debut,
@@ -861,6 +1233,8 @@ def _pdc_union_sql_for_site(site: str) -> str:
         tbl = row["table_name"]
         parts.append(f"""
             SELECT
+              id AS bloc_id,
+              '{tbl}' AS source_table,
               site,
               pdc_id AS equipement_id,
               type_label AS type_equipement,
@@ -898,6 +1272,8 @@ def _pdc_union_sql_all_sites() -> str:
     parts = [
         f"""
             SELECT
+              id AS bloc_id,
+              '{tbl}' AS source_table,
               site,
               pdc_id AS equipement_id,
               type_label AS type_equipement,
@@ -919,9 +1295,9 @@ def _normalize_blocks_df(df: pd.DataFrame) -> pd.DataFrame:
     if df.empty:
         return df.copy()
     out = df.copy()
-    for col in ["date_debut", "date_fin", "processed_at"]:
+    for col in ["date_debut", "date_fin", "processed_at", "exclusion_applied_at"]:
         if col in out.columns:
-            s = pd.to_datetime(out[col], errors="coerce") 
+            s = pd.to_datetime(out[col], errors="coerce")
             try:
                 if s.dt.tz is None:
                     s = s.dt.tz_localize("Europe/Paris", nonexistent="shift_forward", ambiguous="NaT")
@@ -930,14 +1306,41 @@ def _normalize_blocks_df(df: pd.DataFrame) -> pd.DataFrame:
             except Exception:
                 pass
             out[col] = s
-    for col in ["est_disponible","raw_point_count","duration_minutes","is_excluded"]:
+    for col in [
+        "est_disponible",
+        "raw_point_count",
+        "duration_minutes",
+        "is_excluded",
+        "previous_status",
+        "exclusion_id",
+    ]:
         if col in out.columns:
             out[col] = pd.to_numeric(out[col], errors="coerce").fillna(0).astype(int)
         else:
             if col == "is_excluded":
                 out[col] = 0
-    if "is_excluded" in out.columns and "est_disponible" in out.columns:
-        out.loc[out["est_disponible"] == 1, "is_excluded"] = 0
+            elif col == "previous_status":
+                out[col] = 0
+            elif col == "exclusion_id":
+                out[col] = -1
+    if "bloc_id" in out.columns:
+        out["bloc_id"] = pd.to_numeric(out["bloc_id"], errors="coerce").fillna(-1).astype(int)
+    elif "id" in out.columns:
+        out["bloc_id"] = pd.to_numeric(out["id"], errors="coerce").fillna(-1).astype(int)
+    else:
+        out["bloc_id"] = -1
+    if "source_table" in out.columns:
+        out["source_table"] = out["source_table"].fillna("").astype(str)
+    else:
+        out["source_table"] = ""
+    if "previous_status" in out.columns:
+        mask_no_exclusion = out.get("exclusion_id", -1) < 0
+        out.loc[mask_no_exclusion, "previous_status"] = out.loc[mask_no_exclusion, "est_disponible"]
+    else:
+        out["previous_status"] = out.get("est_disponible", 0)
+    for text_col in ["exclusion_comment", "exclusion_applied_by"]:
+        if text_col in out.columns:
+            out[text_col] = out[text_col].fillna("").astype(str)
     return out.sort_values("date_debut").reset_index(drop=True)
 
 
@@ -985,13 +1388,15 @@ def _aggregate_monthly_availability(
             rows.append({"month": month, "pct_brut": 0.0, "pct_excl": 0.0, "total_minutes": 0})
             continue
 
-        avail_brut = int(group.loc[group["est_disponible"] == 1, "duration_minutes_window"].sum())
-        avail_excl = int(
-            group.loc[
-                (group["est_disponible"] == 1) | (group["is_excluded"] == 1),
-                "duration_minutes_window",
-            ].sum()
-        )
+        current_status = group["est_disponible"]
+        avail_brut = int(group.loc[current_status == 1, "duration_minutes_window"].sum())
+
+        if "previous_status" in group.columns:
+            baseline_status = group["previous_status"].where(group["is_excluded"] == 1, current_status)
+        else:
+            baseline_status = current_status
+
+        avail_excl = int(group.loc[baseline_status == 1, "duration_minutes_window"].sum())
 
         rows.append(
             {
@@ -1019,7 +1424,7 @@ def update_annotation_comment(annotation_id: int, comment: str) -> bool:
 def get_annotations(annotation_type: Optional[str] = None, limit: int = 200) -> pd.DataFrame:
     """Récupère les annotations."""
     query = """
-        SELECT id, site, equipement_id, date_debut, date_fin, 
+        SELECT id, site, equipement_id, date_debut, date_fin,
                type_annotation, commentaire, actif, created_by, created_at
         FROM dispo_annotations
     """
@@ -1036,6 +1441,31 @@ def get_annotations(annotation_type: Optional[str] = None, limit: int = 200) -> 
         return execute_query(query, params)
     except DatabaseError as e:
         st.error(f"Erreur lors du chargement des annotations: {e}")
+        return pd.DataFrame()
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def get_block_exclusions(active_only: bool = True, limit: int = 200) -> pd.DataFrame:
+    """Récupère les exclusions enregistrées directement sur les blocs."""
+
+    query = """
+        SELECT id, table_name, bloc_id, previous_status,
+               exclusion_comment, applied_by, applied_at,
+               released_by, released_at, release_comment
+        FROM dispo_blocs_exclusions
+    """
+    params = {"limit": limit}
+    if active_only:
+        query += " WHERE released_at IS NULL"
+    query += " ORDER BY applied_at DESC LIMIT :limit"
+
+    try:
+        engine = get_engine()
+        with engine.begin() as conn:
+            _ensure_exclusion_table(conn)
+        return execute_query(query, params)
+    except DatabaseError as exc:
+        st.error(f"Erreur lors du chargement des exclusions: {exc}")
         return pd.DataFrame()
 
 # Calculs mois
@@ -1057,25 +1487,14 @@ def calculate_availability(
 
     total = int(df["duration_minutes"].sum())
 
-    missing_minutes = int(
-        df.loc[
-            (df["est_disponible"] == -1) & (df["is_excluded"] == 0),
-            "duration_minutes",
-        ].sum()
-    )
+    status_series = df["est_disponible"].copy()
+    if include_exclusions and "previous_status" in df.columns:
+        status_series = df["previous_status"].where(df["is_excluded"] == 1, df["est_disponible"])
 
-    if include_exclusions:
-        available_mask = (
-            (df["est_disponible"] == 1)
-            | ((df["est_disponible"] == 0) & (df["is_excluded"] == 1))
-            | ((df["est_disponible"] == -1) & (df["is_excluded"] == 1))
-        )
-        unavailable_mask = (
-            (df["est_disponible"] == 0) & (df["is_excluded"] == 0)
-        )
-    else:
-        available_mask = df["est_disponible"] == 1
-        unavailable_mask = df["est_disponible"] == 0
+    missing_minutes = int(df.loc[status_series == -1, "duration_minutes"].sum())
+
+    available_mask = status_series == 1
+    unavailable_mask = status_series == 0
 
     available = int(df.loc[available_mask, "duration_minutes"].sum())
     unavailable = int(df.loc[unavailable_mask, "duration_minutes"].sum())
@@ -1158,7 +1577,7 @@ def _build_station_timeline_df(timelines: Dict[str, pd.DataFrame]) -> pd.DataFra
     }
     timeline_df["state"] = timeline_df["est_disponible"].map(state_map).fillna("❓ Inconnu")
     timeline_df["label"] = timeline_df["state"]
-    mask_excl = (timeline_df["is_excluded"] == 1) & (timeline_df["est_disponible"] != 1)
+    mask_excl = timeline_df["is_excluded"] == 1
     timeline_df.loc[mask_excl, "label"] = timeline_df.loc[mask_excl, "state"] + " (Exclu)"
     return timeline_df.sort_values(["Equipement", "start"]).reset_index(drop=True)
 
@@ -1475,89 +1894,13 @@ def _calculate_monthly_availability_equipment(
     if not start_dt or not end_dt:
         end_dt = datetime.utcnow()
         start_dt = (end_dt.replace(day=1) - pd.DateOffset(months=months)).to_pydatetime()
-    params_view = {"start": start_dt, "end": end_dt}
-    q_view = """
-        SELECT site, equipement_id, date_debut, date_fin,
-               est_disponible,
-               TIMESTAMPDIFF(MINUTE, GREATEST(date_debut,:start), LEAST(date_fin,:end)) AS duration_minutes,
-               CASE
-                 WHEN est_disponible <> 1 THEN CAST(EXISTS (
-                   SELECT 1 FROM dispo_annotations a
-                   WHERE a.actif = 1 AND a.type_annotation='exclusion'
-                     AND a.site = site AND a.equipement_id = equipement_id
-                     AND NOT (a.date_fin <= date_debut OR a.date_debut >= date_fin)
-                 ) AS UNSIGNED)
-                 ELSE 0
-               END AS is_excluded
-        FROM dispo_blocs_with_exclusion_flag
-        WHERE date_debut < :end AND date_fin > :start
-    """
-    try:
-        df = execute_query(q_view, params_view)
-        if not df.empty:
-            df = _normalize_blocks_df(df)
-    except DatabaseError:
-        df = pd.DataFrame()
 
-    if df.empty:
-        if site:
-            ac_union   = _ac_union_sql_for_site(site)
-            batt_union = _batt_union_sql_for_site(site)
-            params = {"site": site, "start": start_dt, "end": end_dt}
-            site_filter_ac = ""  
-            site_filter_bt = ""  
-        else:
-            ac_union   = _ac_union_sql_all_sites()
-            batt_union = _batt_union_sql_all_sites()
-            params = {"start": start_dt, "end": end_dt}
-            site_filter_ac = ""
-            site_filter_bt = ""
-
-        equip_clause = "AND b.equipement_id = :equip" if equip else ""
-        if equip:
-            params["equip"] = equip
-
-        q = f"""
-        WITH ac AS (
-            {ac_union}
-        ),
-        batt AS (
-            {batt_union}
-        ),
-        base AS (
-            SELECT
-              site, equipement_id, type_equipement, date_debut, date_fin,
-              est_disponible, cause, raw_point_count, processed_at, batch_id, hash_signature
-            FROM ac {site_filter_ac}
-            UNION ALL
-            SELECT
-              site, equipement_id, type_equipement, date_debut, date_fin,
-              est_disponible, cause, raw_point_count, processed_at, batch_id, hash_signature
-            FROM batt {site_filter_bt}
-        )
-        SELECT
-          b.site, b.equipement_id, b.date_debut, b.date_fin, b.est_disponible,
-          TIMESTAMPDIFF(MINUTE, GREATEST(b.date_debut,:start), LEAST(b.date_fin,:end)) AS duration_minutes,
-          CASE
-            WHEN b.est_disponible <> 1 THEN CAST(EXISTS (
-              SELECT 1 FROM dispo_annotations a
-              WHERE a.actif = 1 AND a.type_annotation='exclusion'
-                AND a.site = b.site AND a.equipement_id = b.equipement_id
-                AND NOT (a.date_fin <= b.date_debut OR a.date_debut >= b.date_fin)
-            ) AS UNSIGNED)
-            ELSE 0
-          END AS is_excluded
-        FROM base b
-        WHERE b.date_debut < :end AND b.date_fin > :start
-          {equip_clause}
-        """
-        df = execute_query(q, params)
-        df = _normalize_blocks_df(df)
-
+    df = load_filtered_blocks(start_dt, end_dt, site, equip, mode=MODE_EQUIPMENT)
     if df.empty:
         return df
 
     return _aggregate_monthly_availability(df, start_dt, end_dt)
+
 
 
 @st.cache_data(ttl=1800, show_spinner=False)
@@ -1572,51 +1915,12 @@ def _calculate_monthly_availability_pdc(
         end_dt = datetime.utcnow()
         start_dt = (end_dt.replace(day=1) - pd.DateOffset(months=months)).to_pydatetime()
 
-    params = {"start": start_dt, "end": end_dt}
-    if site:
-        union_sql = _pdc_union_sql_for_site(site)
-        params["site"] = site
-        site_filter = "AND p.site = :site"
-    else:
-        union_sql = _pdc_union_sql_all_sites()
-        site_filter = ""
-    equip_filter = "AND p.equipement_id = :equip" if equip else ""
-    if equip:
-        params["equip"] = equip
-
-    q = f"""
-    WITH pdc AS (
-        {union_sql}
-    )
-    SELECT
-      p.site,
-      p.equipement_id,
-      p.date_debut,
-      p.date_fin,
-      p.est_disponible,
-      TIMESTAMPDIFF(MINUTE, GREATEST(p.date_debut,:start), LEAST(p.date_fin,:end)) AS duration_minutes,
-      CASE
-        WHEN p.est_disponible <> 1 THEN CAST(EXISTS (
-          SELECT 1 FROM dispo_annotations a
-          WHERE a.actif = 1 AND a.type_annotation='exclusion'
-            AND a.site = p.site AND a.equipement_id = p.equipement_id
-            AND NOT (a.date_fin <= p.date_debut OR a.date_debut >= p.date_fin)
-        ) AS UNSIGNED)
-        ELSE 0
-      END AS is_excluded
-    FROM pdc p
-    WHERE p.date_debut < :end AND p.date_fin > :start
-      {site_filter}
-      {equip_filter}
-    """
-
-    df = execute_query(q, params)
-    df = _normalize_blocks_df(df)
-
+    df = load_filtered_blocks(start_dt, end_dt, site, equip, mode=MODE_PDC)
     if df.empty:
         return df
 
     return _aggregate_monthly_availability(df, start_dt, end_dt)
+
 
 
 def calculate_monthly_availability(
@@ -1831,18 +2135,21 @@ def generate_availability_report(
             {union_sql}
         )
         SELECT
+          b.bloc_id,
           b.site, b.equipement_id, b.date_debut, b.date_fin, b.est_disponible, b.cause,
           TIMESTAMPDIFF(MINUTE, GREATEST(b.date_debut,:start), LEAST(b.date_fin,:end)) AS duration_minutes,
-          CASE
-            WHEN b.est_disponible <> 1 THEN CAST(EXISTS (
-              SELECT 1 FROM dispo_annotations a
-              WHERE a.actif = 1 AND a.type_annotation='exclusion'
-                AND a.site = b.site AND a.equipement_id = b.equipement_id
-                AND NOT (a.date_fin <= b.date_debut OR a.date_debut >= b.date_fin)
-            ) AS UNSIGNED)
-            ELSE 0
-          END AS is_excluded
+          COALESCE(e.previous_status, b.est_disponible) AS previous_status,
+          CASE WHEN e.id IS NOT NULL THEN 1 ELSE 0 END AS is_excluded,
+          e.id AS exclusion_id,
+          e.applied_by AS exclusion_applied_by,
+          e.applied_at AS exclusion_applied_at,
+          e.exclusion_comment AS exclusion_comment,
+          b.source_table
         FROM base b
+        LEFT JOIN dispo_blocs_exclusions e
+          ON e.table_name = b.source_table
+         AND e.bloc_id = b.bloc_id
+         AND e.released_at IS NULL
         WHERE b.date_debut < :end AND b.date_fin > :start
           {site_filter}
         ORDER BY b.equipement_id, b.date_debut
@@ -1879,18 +2186,21 @@ def generate_availability_report(
             FROM batt {site_filter_bt}
         )
         SELECT
+          b.bloc_id,
           b.site, b.equipement_id, b.date_debut, b.date_fin, b.est_disponible, b.cause,
           TIMESTAMPDIFF(MINUTE, GREATEST(b.date_debut,:start), LEAST(b.date_fin,:end)) AS duration_minutes,
-          CASE
-            WHEN b.est_disponible <> 1 THEN CAST(EXISTS (
-              SELECT 1 FROM dispo_annotations a
-              WHERE a.actif = 1 AND a.type_annotation='exclusion'
-                AND a.site = b.site AND a.equipement_id = b.equipement_id
-                AND NOT (a.date_fin <= b.date_debut OR a.date_debut >= b.date_fin)
-            ) AS UNSIGNED)
-            ELSE 0
-          END AS is_excluded
+          COALESCE(e.previous_status, b.est_disponible) AS previous_status,
+          CASE WHEN e.id IS NOT NULL THEN 1 ELSE 0 END AS is_excluded,
+          e.id AS exclusion_id,
+          e.applied_by AS exclusion_applied_by,
+          e.applied_at AS exclusion_applied_at,
+          e.exclusion_comment AS exclusion_comment,
+          b.source_table
         FROM base b
+        LEFT JOIN dispo_blocs_exclusions e
+          ON e.table_name = b.source_table
+         AND e.bloc_id = b.bloc_id
+         AND e.released_at IS NULL
         WHERE b.date_debut < :end AND b.date_fin > :start
         ORDER BY b.equipement_id, b.date_debut
         """
@@ -2710,7 +3020,7 @@ def render_timeline_tab(site: Optional[str], equip: Optional[str], start_dt: dat
     })
 
     df_plot["excluded"] = ""
-    mask_excluded = (df_plot["is_excluded"] == 1) & (df_plot["est_disponible"] != 1)
+    mask_excluded = df_plot["is_excluded"] == 1
     df_plot.loc[mask_excluded, "excluded"] = " (Exclu)"
     df_plot["label"] = df_plot["state"] + df_plot["excluded"]
     
@@ -2731,6 +3041,7 @@ def render_timeline_tab(site: Optional[str], equip: Optional[str], start_dt: dat
         },
         color_discrete_map={
             "✅ Disponible": "#28a745",
+            "✅ Disponible (Exclu)": "#17a2b8",
             "❌ Indisponible": "#dc3545",
             "❌ Indisponible (Exclu)": "#fd7e14",
             "⚠️ Donnée manquante": "#6c757d",
@@ -2914,6 +3225,145 @@ def render_timeline_tab(site: Optional[str], equip: Optional[str], start_dt: dat
         selected_row = df_display.iloc[selected_idx]
         est_val = int(selected_row["est_disponible"])
 
+        bloc_id = int(selected_row.get("bloc_id", -1))
+        source_table = str(selected_row.get("source_table", "") or "")
+
+        active_exclusion = bool(int(selected_row.get("is_excluded", 0)))
+        exclusion_id = selected_row.get("exclusion_id")
+
+        st.markdown("### 🚫 Gestion de l'exclusion du bloc")
+        if bloc_id <= 0 or not source_table:
+            st.warning(
+                "⚠️ Impossible d'identifier ce bloc dans la base : aucune action d'exclusion n'est possible."
+            )
+        else:
+            if active_exclusion:
+                st.info("Ce bloc est actuellement exclu des calculs.")
+                applied_by = selected_row.get("exclusion_applied_by")
+                applied_at = selected_row.get("exclusion_applied_at")
+                applied_comment = selected_row.get("exclusion_comment")
+                previous_status = int(selected_row.get("previous_status", est_val))
+
+                with st.expander("Détails de l'exclusion active", expanded=True):
+                    st.write(
+                        {
+                            "Exclusion #": exclusion_id or "—",
+                            "Appliquée par": applied_by or "—",
+                            "Appliquée le": applied_at.strftime("%Y-%m-%d %H:%M") if isinstance(applied_at, datetime) else str(applied_at or "—"),
+                            "Statut initial": {1: "Disponible", 0: "Indisponible", -1: "Donnée manquante"}.get(previous_status, "Inconnu"),
+                            "Commentaire": applied_comment or "—",
+                        }
+                    )
+
+                with st.form(f"release_exclusion_{bloc_id}"):
+                    release_operator = st.text_input(
+                        "Opérateur (historisation)",
+                        value="",
+                        placeholder="ex: Jean Dupont",
+                        help="Identifiez la personne qui supprime l'exclusion.",
+                    )
+                    release_comment = st.text_area(
+                        "Commentaire de réactivation",
+                        placeholder="Décrivez pourquoi cette exclusion est levée...",
+                        help="Un commentaire détaillé est requis pour tracer le rollback.",
+                    )
+                    submit_release = st.form_submit_button("♻️ Lever l'exclusion et restaurer l'état d'origine")
+
+                    if submit_release:
+                        release_txt = release_comment.strip()
+                        if len(release_txt) < 5:
+                            st.error("❌ Le commentaire doit contenir au moins 5 caractères.")
+                        else:
+                            try:
+                                result = release_block_exclusion(
+                                    table_name=source_table,
+                                    block_id=bloc_id,
+                                    user=release_operator.strip() or None,
+                                    comment=release_txt,
+                                )
+                            except ExclusionError as exc:
+                                st.error(f"❌ Impossible de lever l'exclusion : {exc}")
+                            else:
+                                st.success(
+                                    f"✅ Bloc {result.block_id} restauré avec le statut {result.new_status} (table {result.table_name})."
+                                )
+                                st.balloons()
+                                st.rerun()
+            else:
+                st.warning("Ce bloc est actuellement comptabilisé normalement.")
+                with st.form(f"apply_exclusion_{bloc_id}"):
+                    exclusion_operator = st.text_input(
+                        "Opérateur (historisation)",
+                        value="",
+                        placeholder="ex: Jean Dupont",
+                        help="Identifiez la personne à l'origine de l'exclusion.",
+                    )
+                    exclusion_comment = st.text_area(
+                        "Commentaire obligatoire",
+                        placeholder="Décrivez pourquoi cette période doit être exclue...",
+                        help="Ce commentaire sera stocké pour permettre un rollback.",
+                    )
+                    submit_exclusion = st.form_submit_button("🚫 Exclure ce bloc et le marquer comme disponible")
+
+                    if submit_exclusion:
+                        comment_txt = exclusion_comment.strip()
+                        if len(comment_txt) < 5:
+                            st.error("❌ Le commentaire doit contenir au moins 5 caractères.")
+                        else:
+                            try:
+                                result = apply_block_exclusion(
+                                    table_name=source_table,
+                                    block_id=bloc_id,
+                                    user=exclusion_operator.strip() or None,
+                                    comment=comment_txt,
+                                )
+                            except ExclusionError as exc:
+                                st.error(f"❌ Impossible de créer l'exclusion : {exc}")
+                            else:
+                                st.success(
+                                    f"✅ Bloc {result.block_id} exclu et marqué disponible (table {result.table_name})."
+                                )
+                                st.balloons()
+                                st.rerun()
+
+            else:
+                st.warning("Ce bloc est actuellement comptabilisé normalement.")
+                with st.form(f"apply_exclusion_{bloc_id}"):
+                    exclusion_operator = st.text_input(
+                        "Opérateur (historisation)",
+                        value="",
+                        placeholder="ex: Jean Dupont",
+                        help="Identifiez la personne à l'origine de l'exclusion.",
+                    )
+                    exclusion_comment = st.text_area(
+                        "Commentaire obligatoire",
+                        placeholder="Décrivez pourquoi cette période doit être exclue...",
+                        help="Ce commentaire sera stocké pour permettre un rollback.",
+                    )
+                    submit_exclusion = st.form_submit_button("🚫 Exclure ce bloc et le marquer comme disponible")
+
+                    if submit_exclusion:
+                        comment_txt = exclusion_comment.strip()
+                        if len(comment_txt) < 5:
+                            st.error("❌ Le commentaire doit contenir au moins 5 caractères.")
+                        else:
+                            try:
+                                result = apply_block_exclusion(
+                                    table_name=source_table,
+                                    block_id=bloc_id,
+                                    user=exclusion_operator.strip() or None,
+                                    comment=comment_txt,
+                                )
+                            except ExclusionError as exc:
+                                st.error(f"❌ Impossible de créer l'exclusion : {exc}")
+                            else:
+                                st.success(
+                                    f"✅ Bloc {result.block_id} exclu et marqué disponible (table {result.table_name})."
+                                )
+                                st.balloons()
+                                st.rerun()
+
+
         with st.form("annotation_form", clear_on_submit=True):
             st.markdown(f"**Bloc sélectionné:** {selected_row['start']} → {selected_row['end']}")
             
@@ -3020,342 +3470,107 @@ def render_timeline_tab(site: Optional[str], equip: Optional[str], start_dt: dat
             "Créé par",
             placeholder="Votre nom",
             key="timeline_missing_month_user",
-            help="Identifiez l'opérateur à l'origine de cette exclusion groupée.",
-        )
-
-        if st.button(
-            "🚫 Exclure toutes les données manquantes du mois",
-            use_container_width=True,
-            key="timeline_missing_month_button",
-        ):
-            comment_txt = bulk_comment.strip()
-            if len(comment_txt) < 10:
-                st.error("❌ Le commentaire doit contenir au moins 10 caractères.")
-            else:
-                start_dt = datetime.combine(month_start, time.min)
-                end_dt = datetime.combine(next_month, time.min)
-                user_txt = bulk_user.strip() or "Utilisateur UI"
-
-                with st.spinner("Analyse des données manquantes en cours..."):
-                    df_month = load_blocks(site, equip, start_dt, end_dt, mode=mode)
-
-                if df_month is None or df_month.empty:
-                    st.info("Aucune donnée disponible sur ce mois pour l'équipement sélectionné.")
-                else:
-                    pending = df_month[(df_month["est_disponible"] == -1) & (df_month["is_excluded"] == 0)].copy()
-
-                    if pending.empty:
-                        st.success("Toutes les données manquantes de ce mois sont déjà exclues.")
-                    else:
-                        created = 0
-                        for _, block in pending.iterrows():
-                            start_block = block.get("date_debut")
-                            end_block = block.get("date_fin")
-                            if pd.isna(start_block) or pd.isna(end_block):
-                                continue
-                            start_value = (
-                                start_block.to_pydatetime()
-                                if hasattr(start_block, "to_pydatetime")
-                                else start_block
-                            )
-                            end_value = (
-                                end_block.to_pydatetime()
-                                if hasattr(end_block, "to_pydatetime")
-                                else end_block
-                            )
-                            if create_annotation(
-                                site=site,
-                                equip=equip,
-                                start_dt=start_value,
-                                end_dt=end_value,
-                                annotation_type="exclusion",
-                                comment=comment_txt,
-                                user=user_txt,
-                            ):
-                                created += 1
-
-                        if created > 0:
-                            st.success(
-                                f"✅ {created} exclusion(s) ajoutée(s) pour {month_start.strftime('%Y-%m')}"
-                            )
-                            st.rerun()
-                        else:
-                            st.warning("Aucune exclusion supplémentaire n'a pu être créée.")
-
-    equip_current = st.session_state.get("current_equip")
-    if equip_current:
-        cfg = get_equip_config(equip_current)
-        with st.expander(f"🧩 Traduction manuelle {cfg['title']} – {cfg['pc_field']} / {cfg['ic_field']}", expanded=False):
-            c_ic, c_pc = st.columns(2)
-            ic_key = f"manual_ic_{equip_current}"
-            pc_key = f"manual_pc_{equip_current}"
-            with c_ic:
-                ic_input = st.number_input(
-                    f"Valeur {cfg['ic_field']} (INT32 signé)",
-                    value=st.session_state.get(ic_key, 0), step=1, format="%d",
-                    key=ic_key,
-                    help="Ex: 0, 1, 2, -1…"
-                )
-            with c_pc:
-                pc_input = st.number_input(
-                    f"Valeur {cfg['pc_field']} (INT32 signé)",
-                    value=st.session_state.get(pc_key, 0), step=1, format="%d",
-                    key=pc_key,
-                    help="Ex: 0, 1, 2, -1…"
-                )
-
-            if st.button("🔍 Traduire", key=f"manual_translate_{equip_current}"):
-                txt = translate_ic_pc(ic_input, pc_input, cfg["ic_map"], cfg["pc_map"])
-                st.session_state["cause_traduite"] = txt or ""
-
-            st.text_area(
-                "Cause traduite",
-                value=st.session_state.get("cause_traduite", ""),
-                height=110,
-                disabled=True
-            )
-
-
-def render_inline_delete_table(
-    df: pd.DataFrame,
-    column_settings: List[Tuple[str, str, float]],
-    key_prefix: str,
-    delete_handler: Callable[[int], bool],
-    success_message: str,
-    error_message: str,
-) -> None:
-    """Affiche un tableau avec un bouton de suppression sur chaque ligne."""
-
-    if df.empty:
-        return
-
-    columns = [field for field, _, _ in column_settings]
-    df_to_display = df[columns].copy()
-
-    weights = [weight for _, _, weight in column_settings] + [0.8]
-
-    header_cols = st.columns(weights)
-    for container, (_, header, _) in zip(header_cols[:-1], column_settings):
-        container.markdown(f"**{header}**")
-    header_cols[-1].markdown("**Action**")
-
-    for _, row in df_to_display.iterrows():
-        row_cols = st.columns(weights)
-        for container, (field, _, _) in zip(row_cols[:-1], column_settings):
-            value = row[field]
-            if pd.isna(value) or value == "":
-                display_value = "—"
-            else:
-                display_value = value
-            container.write(display_value)
-
-        action_container = row_cols[-1]
-        button_key = f"{key_prefix}_delete_{row['id']}"
-        with action_container:
-            if st.button("🗑️ Supprimer", key=button_key, use_container_width=True):
-                row_id = int(row["id"])
-                if delete_handler(row_id):
-                    st.success(success_message.format(id=row_id))
-                    st.rerun()
-                else:
-                    st.error(error_message.format(id=row_id))
-
-
 def render_exclusions_tab():
     mode = get_current_mode()
-    st.header("🚫 Gestion des Exclusions")
-    
-    st.markdown("""
-    Les **exclusions** permettent de marquer certaines périodes comme ne devant pas être comptabilisées 
-    dans le calcul de disponibilité (maintenances planifiées, arrêts programmés, etc.).
-    """)
-    
-    with st.expander("➕ Ajouter une Nouvelle Exclusion", expanded=False):
-        sites = get_sites(mode)
-        
-        if not sites:
-            st.error("❌ Aucun site disponible.")
-            return
-        
-        col1, col2 = st.columns(2)
-        
-        with col1:
-            selected_site = st.selectbox(
-                "Site",
-                options=sites,
-                key="excl_site",
-                format_func=lambda code: mapping_sites.get(code.split("_")[-1], code),
-                help="Sélectionnez le site concerné"
-            )
-        
-        with col2:
-            equips = get_equipments(mode, selected_site)
-            if not equips:
-                st.warning("⚠️ Aucun équipement disponible pour ce site.")
-                return
-            
-            selected_equip = st.selectbox(
-                "Équipement",
-                options=equips,
-                key="excl_equip",
-                help="Sélectionnez l'équipement concerné"
-            )
-        
-        col3, col4 = st.columns(2)
-        today = datetime.utcnow().date()
+    st.header("🚫 Gestion des exclusions")
 
-        with col3:
-            start_date = st.date_input(
-                "Date de début",
-                value=today,
-                key="excl_start",
-                help="Date de début de l'exclusion"
-            )
-            start_time = st.time_input(
-                "Heure de début",
-                value=time(hour=0, minute=0),
-                key="excl_start_time",
-                help="Heure de début de l'exclusion"
-            )
+    st.markdown(
+        """
+        Les exclusions actives sont appliquées directement sur les blocs de disponibilité.
+        Utilisez la timeline pour créer de nouvelles exclusions et ce panneau pour consulter
+        ou lever celles qui sont encore actives.
+        """
+    )
 
-        with col4:
-            end_date = st.date_input(
-                "Date de fin",
-                value=today + timedelta(days=1),
-                min_value=start_date,
-                key="excl_end",
-                help="Date de fin de l'exclusion"
-            )
-            end_time = st.time_input(
-                "Heure de fin",
-                value=time(hour=23, minute=59),
-                key="excl_end_time",
-                help="Heure de fin de l'exclusion"
-            )
-
-        comment = st.text_area(
-            "Raison de l'exclusion",
-            placeholder="ex: Maintenance planifiée, arrêt programmé pour travaux...",
-            key="excl_comment",
-            help="Obligatoire - Décrivez la raison de cette exclusion"
-        )
-        
-        user_name = st.text_input(
-            "Créé par",
-            placeholder="Votre nom",
-            key="excl_user",
-            help="Votre identité pour traçabilité"
-        )
-        
-        if st.button("✅ Créer l'Exclusion", type="primary", use_container_width=True):
-            if not comment or len(comment.strip()) < 10:
-                st.error("❌ La raison de l'exclusion doit contenir au moins 10 caractères.")
-            else:
-                start_dt = datetime.combine(start_date, start_time)
-                end_dt = datetime.combine(end_date, end_time)
-
-                if end_dt <= start_dt:
-                    st.error("❌ La date/heure de fin doit être postérieure à la date/heure de début.")
-                else:
-                    user = user_name.strip() or "Utilisateur UI"
-
-                    success = create_annotation(
-                        site=selected_site,
-                        equip=selected_equip,
-                        start_dt=start_dt,
-                        end_dt=end_dt,
-                        annotation_type="exclusion",
-                        comment=comment.strip(),
-                        user=user
-                    )
-
-                    if success:
-                        st.success("✅ Exclusion créée avec succès !")
-                        st.rerun()
-
-
-    st.divider()
-    
-    st.subheader("📋 Exclusions Existantes")
-    df_exclusions = get_annotations(annotation_type="exclusion", limit=200)
-    if df_exclusions.empty:
-        st.info("ℹ️ Aucune exclusion enregistrée pour le moment.")
+    st.subheader("🔒 Exclusions actives")
+    df_active = get_block_exclusions(active_only=True, limit=200)
+    if df_active.empty:
+        st.success("✅ Aucune exclusion active dans la base de données.")
     else:
-        df_display = df_exclusions.copy()
-        df_display["Période"] = df_display.apply(
-            lambda r: f"{pd.to_datetime(r['date_debut']).strftime('%Y-%m-%d')} → {pd.to_datetime(r['date_fin']).strftime('%Y-%m-%d')}",
-            axis=1
-        )
-        df_display["Statut"] = df_display["actif"].map({1: "✅ Active", 0: "❌ Inactive"})
-        df_display["Créé le"] = pd.to_datetime(df_display["created_at"]).dt.strftime("%Y-%m-%d %H:%M")
-        
-        columns_config = [
-            ("id", "ID", 0.8),
-            ("site", "Site", 1.1),
-            ("equipement_id", "Équipement", 1.2),
-            ("Période", "Période", 1.8),
-            ("Statut", "Statut", 1.0),
-            ("commentaire", "Commentaire", 2.5),
-            ("created_by", "Créé par", 1.2),
-            ("Créé le", "Créé le", 1.3),
+        for _, row in df_active.iterrows():
+            block_label = f"Bloc #{int(row['bloc_id'])} · {row['table_name']}"
+            status_label = {1: "Disponible", 0: "Indisponible", -1: "Donnée manquante"}.get(int(row.get("previous_status", -1)), "Inconnu")
+            with st.expander(block_label, expanded=False):
+                st.write(
+                    {
+                        "Statut initial": status_label,
+                        "Commentaire": row.get("exclusion_comment") or "—",
+                        "Appliquée par": row.get("applied_by") or "—",
+                        "Appliquée le": pd.to_datetime(row.get("applied_at")).strftime("%Y-%m-%d %H:%M") if row.get("applied_at") else "—",
+                    }
+                )
+
+                form_key = f"release_form_{row['id']}"
+                with st.form(form_key):
+                    release_operator = st.text_input(
+                        "Opérateur (historisation)",
+                        placeholder="ex: Jean Dupont",
+                        key=f"release_operator_{row['id']}",
+                    )
+                    release_comment = st.text_area(
+                        "Commentaire de réactivation",
+                        placeholder="Expliquez pourquoi l'exclusion est levée",
+                        key=f"release_comment_{row['id']}",
+                    )
+                    submit_release = st.form_submit_button("♻️ Lever l'exclusion")
+                    if submit_release:
+                        comment_txt = release_comment.strip()
+                        if len(comment_txt) < 5:
+                            st.error("❌ Le commentaire doit contenir au moins 5 caractères.")
+                        else:
+                            try:
+                                release_block_exclusion(
+                                    table_name=str(row["table_name"]),
+                                    block_id=int(row["bloc_id"]),
+                                    user=release_operator.strip() or None,
+                                    comment=comment_txt,
+                                )
+                            except ExclusionError as exc:
+                                st.error(f"❌ Impossible de lever l'exclusion : {exc}")
+                            else:
+                                st.success(f"✅ Exclusion #{int(row['id'])} levée.")
+                                st.rerun()
+
+    st.subheader("🕒 Historique récent")
+    df_history = get_block_exclusions(active_only=False, limit=200)
+    if df_history.empty:
+        st.info("ℹ️ Aucun historique disponible.")
+    else:
+        history = df_history.copy()
+        history["Statut"] = history["released_at"].apply(lambda v: "✅ Active" if pd.isna(v) else "❌ Levée")
+        status_map = {1: "Disponible", 0: "Indisponible", -1: "Donnée manquante"}
+        history["Statut initial"] = history["previous_status"].map(status_map).fillna("Inconnu")
+        history["Appliquée le"] = pd.to_datetime(history["applied_at"]).dt.strftime("%Y-%m-%d %H:%M")
+        history["Levée le"] = pd.to_datetime(history["released_at"]).dt.strftime("%Y-%m-%d %H:%M")
+        display_cols = [
+            "id",
+            "table_name",
+            "bloc_id",
+            "Statut",
+            "Statut initial",
+            "exclusion_comment",
+            "applied_by",
+            "Appliquée le",
+            "released_by",
+            "Levée le",
+            "release_comment",
         ]
-
-        st.caption("Cliquez sur 🗑️ pour supprimer une exclusion directement depuis la liste.")
-        render_inline_delete_table(
-            df_display,
-            column_settings=columns_config,
-            key_prefix="exclusion",
-            delete_handler=delete_annotation,
-            success_message="✅ Exclusion #{id} supprimée !",
-            error_message="❌ Échec de suppression pour l'exclusion #{id}."
+        history = history[display_cols]
+        st.dataframe(
+            history,
+            hide_index=True,
+            use_container_width=True,
+            column_config={
+                "id": st.column_config.NumberColumn("ID", width="small"),
+                "table_name": st.column_config.TextColumn("Table", width="medium"),
+                "bloc_id": st.column_config.NumberColumn("Bloc", width="small"),
+                "Statut initial": st.column_config.TextColumn("Statut initial", width="medium"),
+                "exclusion_comment": st.column_config.TextColumn("Commentaire", width="large"),
+                "applied_by": st.column_config.TextColumn("Appliquée par", width="medium"),
+                "released_by": st.column_config.TextColumn("Levée par", width="medium"),
+                "release_comment": st.column_config.TextColumn("Commentaire de levée", width="large"),
+            },
         )
-
-        st.subheader("⚙️ Gérer une Exclusion")
-
-        col1, col2 = st.columns([2, 1])
-        
-        with col1:
-            selected_id = st.number_input(
-                "ID de l'exclusion à gérer",
-                min_value=0,
-                value=0,
-                step=1,
-                help="Entrez l'ID de l'exclusion à modifier"
-            )
-        
-        if selected_id > 0:
-            selected_excl = df_exclusions[df_exclusions["id"] == selected_id]
-            
-            if selected_excl.empty:
-                st.error(f"❌ Aucune exclusion trouvée avec l'ID {selected_id}")
-            else:
-                excl_info = selected_excl.iloc[0]
-                is_active = excl_info["actif"] == 1
-                
-                st.info(f"""
-                **Exclusion #{selected_id}**  
-                📍 Site: {excl_info['site']} | Équipement: {excl_info['equipement_id']}  
-                📅 Période: {pd.to_datetime(excl_info['date_debut']).strftime('%Y-%m-%d')} → {pd.to_datetime(excl_info['date_fin']).strftime('%Y-%m-%d')}  
-                💬 Commentaire: {excl_info['commentaire']}  
-                📊 Statut: {"✅ Active" if is_active else "❌ Inactive"}
-                """)
-                
-                col_btn1, col_info = st.columns([1, 1])
-
-                with col_btn1:
-                    if not is_active:
-                        if st.button("✅ Activer", use_container_width=True, type="primary"):
-                            if toggle_annotation(selected_id, True):
-                                st.success(f"✅ Exclusion #{selected_id} activée !")
-                                st.rerun()
-                    else:
-                        if st.button("❌ Désactiver", use_container_width=True):
-                            if toggle_annotation(selected_id, False):
-                                st.warning(f"⚠️ Exclusion #{selected_id} désactivée !")
-                                st.rerun()
-
-                with col_info:
-                    st.caption("🗑️ Utilisez la liste ci-dessus pour supprimer une exclusion.")
 
 def render_comments_tab():
     """Affiche l'onglet de gestion des commentaires."""
