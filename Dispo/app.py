@@ -2226,11 +2226,13 @@ def generate_availability_report(
         ),
         base AS (
             SELECT
+              bloc_id, source_table,
               site, equipement_id, type_equipement, date_debut, date_fin,
               est_disponible, cause, raw_point_count, processed_at, batch_id, hash_signature
             FROM ac {site_filter_ac}
             UNION ALL
             SELECT
+              bloc_id, source_table,
               site, equipement_id, type_equipement, date_debut, date_fin,
               est_disponible, cause, raw_point_count, processed_at, batch_id, hash_signature
             FROM batt {site_filter_bt}
