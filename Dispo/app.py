@@ -162,6 +162,14 @@ def execute_query(query: str, params: Optional[Dict] = None) -> pd.DataFrame:#k
     try:#k
         engine = get_engine()#k
         with engine.connect() as conn:#k
+            if "dispo_blocs_exclusions" in query:#k
+                try:#k
+                    _ensure_exclusion_table(conn)#k
+                except SQLAlchemyError as ensure_exc:#k
+                    logger.warning(#k
+                        "Impossible de créer la table des exclusions avant la requête: %s",#k
+                        ensure_exc,#k
+                    )#k
             df = pd.read_sql_query(text(query), conn, params=params or {})#k
         return df#k
     except SQLAlchemyError as e:#k
@@ -499,6 +507,65 @@ def delete_annotation(annotation_id: int) -> bool:
     query = "DELETE FROM dispo_annotations WHERE id = :id"
     params = {"id": annotation_id}
     return execute_write(query, params)
+#k
+#k
+def render_inline_delete_table(
+    df: pd.DataFrame,#k
+    *,#k
+    column_settings: List[Tuple[str, str, float]],#k
+    key_prefix: str,#k
+    delete_handler: Callable[[int], bool],#k
+    success_message: str,#k
+    error_message: str,#k
+) -> None:#k
+    """Affiche un tableau avec une action de suppression en ligne pour chaque ligne."""#k
+
+    if df.empty:#k
+        st.info("ℹ️ Aucun enregistrement à afficher.")#k
+        return#k
+
+    widths = [max(width, 0.5) for _, _, width in column_settings]#k
+    action_width = 0.7#k
+
+    header_cols = st.columns(widths + [action_width])#k
+    for col, (_, label, _) in enumerate(column_settings):#k
+        header_cols[col].markdown(f"**{label}**")#k
+    header_cols[-1].markdown("**Actions**")#k
+
+    for idx, row in df.iterrows():#k
+        cols = st.columns(widths + [action_width])#k
+        row_dict = row.to_dict()#k
+
+        for col, (col_name, _, _) in enumerate(column_settings):#k
+            value = row_dict.get(col_name, "")#k
+            display_value = "—" if pd.isna(value) or value == "" else value#k
+            cols[col].write(display_value)#k
+
+        delete_key = f"{key_prefix}_delete_{row_dict.get('id', idx)}_{idx}"#k
+
+        if cols[-1].button("🗑️", key=delete_key):#k
+            with st.spinner("Suppression en cours..."):#k
+                try:#k
+                    identifier = int(row_dict.get("id"))#k
+                except (TypeError, ValueError):#k
+                    identifier = None#k
+
+                success = False#k
+                if identifier is not None:#k
+                    try:#k
+                        success = bool(delete_handler(identifier))#k
+                    except Exception as exc:  # pragma: no cover - sécurité UI#k
+                        logger.exception("Erreur lors de la suppression: %s", exc)#k
+
+                message_context = {k: row_dict.get(k) for k, _, _ in column_settings}#k
+                message_context.update(row_dict)#k
+
+                if success:#k
+                    st.success(success_message.format(**message_context))#k
+                    invalidate_cache()#k
+                    st.experimental_rerun()#k
+                else:#k
+                    st.error(error_message.format(**message_context))#k
 #k
 #k
 def invalidate_cache():#k
