@@ -2705,12 +2705,23 @@ def render_overview_tab(df: Optional[pd.DataFrame]):
         )
 
     with col3:
-        # CORRECTION: Utiliser effective_minutes (temps avec données)
-        # au lieu de total_minutes (qui inclut les -1)
+        # Afficher le temps analysé après exclusions pour refléter les reclassements
+        analyzed_minutes = stats_excl['effective_minutes']
+        analyzed_delta = analyzed_minutes - stats_raw['effective_minutes']
+        if analyzed_delta:
+            delta_prefix = "+" if analyzed_delta > 0 else "-"
+            delta_value = f"{delta_prefix} {format_minutes(abs(analyzed_delta))}"
+        else:
+            delta_value = None
+
         st.metric(
             "Temps analysé",
-            format_minutes(stats_raw['effective_minutes']),
-            help=f"Temps avec des données de disponibilité (excluant {format_minutes(stats_raw['missing_minutes'])} manquantes)"
+            format_minutes(analyzed_minutes),
+            delta=delta_value,
+            help=(
+                "Temps total disposant de données après application des exclusions "
+                f"(données manquantes initiales : {format_minutes(stats_raw['missing_minutes'])})."
+            )
         )
 
     with col4:
