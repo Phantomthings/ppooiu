@@ -1595,30 +1595,25 @@ def _aggregate_monthly_availability(
             rows.append({"month": month, "pct_brut": 0.0, "pct_excl": 0.0, "total_minutes": 0})
             continue
 
-        durations = group["duration_minutes_window"]
+        # CORRECTION: Inverser la logique
         current_status = group["est_disponible"]
-
+        
+        # Disponibilité BRUTE = statut AVANT exclusions (previous_status pour les exclus)
         if "is_excluded" in group.columns and "previous_status" in group.columns:
             brut_status = current_status.where(group["is_excluded"] == 0, group["previous_status"])
         else:
             brut_status = current_status
-
-        def _availability_percentage(status_series: pd.Series) -> float:
-            available = int(durations.loc[status_series == 1].sum())
-            unavailable = int(durations.loc[status_series == 0].sum())
-            effective_total = available + unavailable
-            if effective_total <= 0:
-                return 0.0
-            return available / effective_total * 100.0
-
-        pct_brut = _availability_percentage(brut_status)
-        pct_excl = _availability_percentage(current_status)
+        
+        avail_brut = int(group.loc[brut_status == 1, "duration_minutes_window"].sum())
+        
+        # Disponibilité AVEC EXCLUSIONS = statut ACTUEL (est_disponible)
+        avail_excl = int(group.loc[current_status == 1, "duration_minutes_window"].sum())
 
         rows.append(
             {
                 "month": month,
-                "pct_brut": pct_brut,
-                "pct_excl": pct_excl,
+                "pct_brut": avail_brut / total * 100.0,
+                "pct_excl": avail_excl / total * 100.0,
                 "total_minutes": total,
             }
         )
@@ -2780,7 +2775,6 @@ def render_overview_tab(df: Optional[pd.DataFrame]):
         )
 
     with col3:
-        # Afficher le temps analysé après exclusions pour refléter les reclassements
         analyzed_minutes = stats_excl['effective_minutes']
         analyzed_delta = analyzed_minutes - stats_raw['effective_minutes']
         if analyzed_delta:
@@ -2800,20 +2794,17 @@ def render_overview_tab(df: Optional[pd.DataFrame]):
         )
 
     with col4:
-        # CORRECTION: Utiliser stats_excl pour montrer l'impact des exclusions
         st.metric(
             "Temps Indisponible (avec exclusions)",
             format_minutes(stats_excl['unavailable_minutes']),
             delta=f"{stats_excl['unavailable_minutes'] - stats_raw['unavailable_minutes']} min",
-            delta_color="inverse",  # Plus d'indispo = mauvais (rouge)
+            delta_color="inverse", 
             help="Temps total d'indisponibilité après application des exclusions"
         )
     st.divider()
     
-    # Tableau récapitulatif des 3 équipements
     st.subheader("📋 Tableau Récapitulatif des Équipements")
     
-    # Récupérer les données pour le tableau récapitulatif
     site_current = st.session_state.get("current_site")
     start_dt_current = st.session_state.get("current_start_dt")
     end_dt_current = st.session_state.get("current_end_dt")
@@ -3616,6 +3607,58 @@ def render_timeline_tab(site: Optional[str], equip: Optional[str], start_dt: dat
                     st.info(f"**Cause :** {cause_originale}")
                     st.rerun()
 
+        st.markdown("---")  
+        st.markdown("### 💬 Ajouter un Commentaire")
+        st.caption("Ajouter un commentaire informatif pour ce bloc sans affecter les calculs de disponibilité.")
+
+        with st.form(f"add_comment_{bloc_id}"):
+            comment_operator = st.text_input(
+                "Créé par",
+                value="",
+                placeholder="ex: Jean Dupont",
+                help="Identifiez la personne qui ajoute ce commentaire.",
+            )
+            
+            comment_text = st.text_area(
+                "Commentaire",
+                placeholder="Décrivez l'événement, l'observation ou toute information pertinente pour cette période...",
+                help="Ce commentaire sera visible dans l'onglet 'Gestion des Commentaires'.",
+                height=120
+            )
+            
+            submit_comment = st.form_submit_button("💬 Ajouter le commentaire", type="primary")
+            
+            if submit_comment:
+                comment_txt = comment_text.strip()
+                if len(comment_txt) < 5:
+                    st.error("❌ Le commentaire doit contenir au moins 5 caractères.")
+                else:
+                    try:
+                        # Récupérez le site et l'équipement depuis la session
+                        site = st.session_state.get("current_site", "")
+                        equipement = st.session_state.get("current_equip", "")
+                        
+                        # Utilisez directement les dates du bloc sélectionné
+                        success = create_annotation(
+                            site=site,
+                            equip=equipement,
+                            start_dt=selected_row["start"],
+                            end_dt=selected_row["end"],
+                            annotation_type="commentaire",
+                            comment=comment_txt,
+                            user=comment_operator.strip() or "ui",
+                            cascade=False
+                        )
+                        
+                        if success:
+                            st.success(f"✅ Commentaire ajouté avec succès !")
+                            st.balloons()
+                            st.rerun()
+                        else:
+                            st.error("❌ Échec de l'ajout du commentaire.")
+                        
+                    except Exception as exc:
+                        st.error(f"❌ Impossible d'ajouter le commentaire : {exc}")
     with st.expander("⚡ Exclusion rapide des données manquantes", expanded=False):
         month_default = datetime.utcnow().date().replace(day=1)
         month_candidates = [
