@@ -3690,17 +3690,33 @@ def render_timeline_tab(site: Optional[str], equip: Optional[str], start_dt: dat
 
             col_comment_dates = st.columns(2)
             with col_comment_dates[0]:
-                comment_start = st.datetime_input(
+                comment_start_date = st.date_input(
                     "Début du commentaire",
-                    value=default_comment_start,
+                    value=default_comment_start.date(),
+                    help="Date et heure de début de la période couverte par le commentaire.",
+                    key=f"comment_start_date_{bloc_id}",
+                )
+                comment_start_time = st.time_input(
+                    "Heure de début",
+                    value=default_comment_start.time().replace(second=0, microsecond=0),
+                    key=f"comment_start_time_{bloc_id}",
                     help="Date et heure de début de la période couverte par le commentaire.",
                 )
+                comment_start = datetime.combine(comment_start_date, comment_start_time)
             with col_comment_dates[1]:
-                comment_end = st.datetime_input(
+                comment_end_date = st.date_input(
                     "Fin du commentaire",
-                    value=default_comment_end,
+                    value=default_comment_end.date(),
+                    help="Date et heure de fin de la période couverte par le commentaire.",
+                    key=f"comment_end_date_{bloc_id}",
+                )
+                comment_end_time = st.time_input(
+                    "Heure de fin",
+                    value=default_comment_end.time().replace(second=0, microsecond=0),
+                    key=f"comment_end_time_{bloc_id}",
                     help="Date et heure de fin de la période couverte par le commentaire.",
                 )
+                comment_end = datetime.combine(comment_end_date, comment_end_time)
 
             submit_comment = st.form_submit_button("💾 Enregistrer le commentaire", type="primary")
 
