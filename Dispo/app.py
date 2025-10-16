@@ -327,9 +327,13 @@ def apply_block_exclusion(
     *,
     user: Optional[str] = None,
     comment: Optional[str] = None,
+    new_status: int = 1,
 ) -> ExclusionActionResult:
     if not _is_valid_table_name(table_name):
         raise ExclusionError("Nom de table invalide pour l'exclusion.")
+
+    if new_status not in (0, 1):
+        raise ExclusionError("Valeur 'est_disponible' invalide pour l'exclusion.")
 
     engine = get_engine()
     current_status: Optional[int] = None
@@ -341,7 +345,7 @@ def apply_block_exclusion(
             _ensure_reclassification_history_table(conn)
 
             current_status = _fetch_block_status(conn, table_name, block_id)
-            if current_status == 1:
+            if current_status == 1 and new_status == 1:
                 raise ExclusionError("Le bloc est déjà disponible, exclusion inutile.")
 
             existing = _get_active_exclusion(conn, table_name, block_id)
@@ -351,11 +355,14 @@ def apply_block_exclusion(
             update_stmt = text(
                 f"""
                 UPDATE `{table_name}`
-                SET est_disponible = 1
+                SET est_disponible = :new_status
                 WHERE id = :block_id
                 """
             )
-            result = conn.execute(update_stmt, {"block_id": block_id})
+            result = conn.execute(
+                update_stmt,
+                {"block_id": block_id, "new_status": int(new_status)},
+            )
             if result.rowcount == 0:
                 raise ExclusionError("Aucun bloc mis à jour lors de l'exclusion.")
 
@@ -395,7 +402,7 @@ def apply_block_exclusion(
                     "table_name": table_name,
                     "bloc_id": block_id,
                     "old_status": current_status,
-                    "new_status": 1,
+                    "new_status": int(new_status),
                     "user": user,
                     "comment": comment,
                 },
@@ -415,7 +422,7 @@ def apply_block_exclusion(
         block_id=block_id,
         exclusion_id=int(exclusion_id),
         previous_status=current_status,
-        new_status=1,
+        new_status=int(new_status),
         changed_by=user,
         comment=comment,
     )
@@ -3373,7 +3380,30 @@ def render_timeline_tab(site: Optional[str], equip: Optional[str], start_dt: dat
                         placeholder="Décrivez pourquoi cette période doit être exclue...",
                         help="Ce commentaire sera stocké pour permettre un rollback.",
                     )
-                    submit_exclusion = st.form_submit_button("🚫 Exclure ce bloc et le marquer comme disponible")
+                    target_status = 1
+                    if est_val == -1:
+                        status_labels = {
+                            1: "✅ Disponible (1)",
+                            0: "⛔ Indisponible (0)",
+                        }
+                        target_status = st.radio(
+                            "Statut à appliquer pendant l'exclusion",
+                            options=[1, 0],
+                            index=0,
+                            format_func=lambda x: status_labels.get(int(x), str(x)),
+                            horizontal=True,
+                            help="Choisissez le statut à appliquer lorsque les données sont manquantes.",
+                        )
+                    else:
+                        st.caption(
+                            "Le bloc sera marqué comme disponible pendant la période d'exclusion."
+                        )
+
+                    button_label = (
+                        "🚫 Exclure ce bloc et le marquer comme "
+                        f"{'disponible' if int(target_status) == 1 else 'indisponible'}"
+                    )
+                    submit_exclusion = st.form_submit_button(button_label)
 
                     if submit_exclusion:
                         comment_txt = exclusion_comment.strip()
@@ -3386,12 +3416,17 @@ def render_timeline_tab(site: Optional[str], equip: Optional[str], start_dt: dat
                                     block_id=bloc_id,
                                     user=exclusion_operator.strip() or None,
                                     comment=comment_txt,
+                                    new_status=int(target_status),
                                 )
                             except ExclusionError as exc:
                                 st.error(f"❌ Impossible de créer l'exclusion : {exc}")
                             else:
                                 st.success(
-                                    f"✅ Bloc {result.block_id} exclu et marqué disponible (table {result.table_name})."
+                                    "✅ Bloc {bloc} exclu et marqué {statut} (table {table}).".format(
+                                        bloc=result.block_id,
+                                        statut="disponible" if result.new_status == 1 else "indisponible",
+                                        table=result.table_name,
+                                    )
                                 )
                                 st.balloons()
                                 st.rerun()
