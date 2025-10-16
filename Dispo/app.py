@@ -1492,15 +1492,19 @@ def _aggregate_monthly_availability(
             rows.append({"month": month, "pct_brut": 0.0, "pct_excl": 0.0, "total_minutes": 0})
             continue
 
+        # CORRECTION: Inverser la logique
         current_status = group["est_disponible"]
-        avail_brut = int(group.loc[current_status == 1, "duration_minutes_window"].sum())
-
-        if "previous_status" in group.columns:
-            baseline_status = group["previous_status"].where(group["is_excluded"] == 1, current_status)
+        
+        # Disponibilité BRUTE = statut AVANT exclusions (previous_status pour les exclus)
+        if "is_excluded" in group.columns and "previous_status" in group.columns:
+            brut_status = current_status.where(group["is_excluded"] == 0, group["previous_status"])
         else:
-            baseline_status = current_status
-
-        avail_excl = int(group.loc[baseline_status == 1, "duration_minutes_window"].sum())
+            brut_status = current_status
+        
+        avail_brut = int(group.loc[brut_status == 1, "duration_minutes_window"].sum())
+        
+        # Disponibilité AVEC EXCLUSIONS = statut ACTUEL (est_disponible)
+        avail_excl = int(group.loc[current_status == 1, "duration_minutes_window"].sum())
 
         rows.append(
             {
@@ -1577,6 +1581,14 @@ def calculate_availability(
     df: Optional[pd.DataFrame],
     include_exclusions: bool = False
 ) -> Dict[str, float]:
+    """
+    Calcule la disponibilité.
+    
+    Args:
+        include_exclusions: 
+            - False = Disponibilité brute (statut AVANT exclusions = previous_status)
+            - True = Disponibilité avec exclusions (statut ACTUEL = est_disponible)
+    """
     if df is None or df.empty:
         return {
             "total_minutes": 0,
@@ -1587,32 +1599,31 @@ def calculate_availability(
             "pct_available": 0.0,
             "pct_unavailable": 0.0,
         }
-
+    
     total = int(df["duration_minutes"].sum())
-    status_series = df["est_disponible"].copy()
-
-    if include_exclusions and "is_excluded" in df.columns:
-        status_series = status_series.copy()
-        mask_excluded = df["is_excluded"] == 1
-
-        if "exclusion_mode" in df.columns:
-            as_avail = mask_excluded & (df["exclusion_mode"] == "as_available")
-            as_unav = mask_excluded & (df["exclusion_mode"] == "as_unavailable")
-            status_series.loc[as_avail] = 1
-            status_series.loc[as_unav] = 0
-            mask_excluded = mask_excluded & ~(as_avail | as_unav)
-
-        if mask_excluded.any() and "previous_status" in df.columns:
-            status_series.loc[mask_excluded] = df.loc[mask_excluded, "previous_status"]
-
+    
+    # INVERSION DE LA LOGIQUE
+    if include_exclusions:
+        # Disponibilité avec exclusions = statut ACTUEL (modifié par les exclusions)
+        status_series = df["est_disponible"].copy()
+    else:
+        # Disponibilité brute = statut AVANT exclusions
+        status_series = df["est_disponible"].copy()
+        
+        # Restaurer le statut précédent pour les blocs exclus
+        if "is_excluded" in df.columns and "previous_status" in df.columns:
+            # Pour les blocs exclus, prendre le previous_status
+            mask_excluded = df["is_excluded"] == 1
+            status_series = status_series.where(~mask_excluded, df["previous_status"])
+    
     missing_minutes = int(df.loc[status_series == -1, "duration_minutes"].sum())
     available = int(df.loc[status_series == 1, "duration_minutes"].sum())
     unavailable = int(df.loc[status_series == 0, "duration_minutes"].sum())
     effective_total = available + unavailable
-
+    
     pct_available = (available / effective_total * 100) if effective_total > 0 else 0.0
     pct_unavailable = (unavailable / effective_total * 100) if effective_total > 0 else 0.0
-
+    
     return {
         "total_minutes": total,
         "effective_minutes": effective_total,
@@ -1622,8 +1633,6 @@ def calculate_availability(
         "pct_available": pct_available,
         "pct_unavailable": pct_unavailable,
     }
-
-
 def _station_equipment_modes() -> List[Tuple[str, str]]:
     equipments = [("AC", MODE_EQUIPMENT), ("DC1", MODE_EQUIPMENT), ("DC2", MODE_EQUIPMENT)]
     equipments.extend([(f"PDC{i}", MODE_PDC) for i in range(1, 7)])
@@ -2663,19 +2672,23 @@ def render_overview_tab(df: Optional[pd.DataFrame]):
         )
 
     with col3:
+        # CORRECTION: Utiliser effective_minutes (temps avec données)
+        # au lieu de total_minutes (qui inclut les -1)
         st.metric(
-            "Durée Totale",
-            format_minutes(stats_raw['total_minutes']),
-            help="Durée totale de la période analysée"
+            "Temps analysé",
+            format_minutes(stats_raw['effective_minutes']),
+            help=f"Temps avec des données de disponibilité (excluant {format_minutes(stats_raw['missing_minutes'])} manquantes)"
         )
 
     with col4:
+        # CORRECTION: Utiliser stats_excl pour montrer l'impact des exclusions
         st.metric(
-            "Temps Indisponible",
-            format_minutes(stats_raw['unavailable_minutes']),
-            help="Temps total d'indisponibilité brute"
+            "Temps Indisponible (avec exclusions)",
+            format_minutes(stats_excl['unavailable_minutes']),
+            delta=f"{stats_excl['unavailable_minutes'] - stats_raw['unavailable_minutes']} min",
+            delta_color="inverse",  # Plus d'indispo = mauvais (rouge)
+            help="Temps total d'indisponibilité après application des exclusions"
         )
-
     st.divider()
     
     # Tableau récapitulatif des 3 équipements
