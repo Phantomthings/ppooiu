@@ -1495,12 +1495,12 @@ def _aggregate_monthly_availability(
         current_status = group["est_disponible"]
         avail_brut = int(group.loc[current_status == 1, "duration_minutes_window"].sum())
 
-        if "previous_status" in group.columns:
-            baseline_status = group["previous_status"].where(group["is_excluded"] == 1, current_status)
+        if "is_excluded" in group.columns:
+            adjusted_status = current_status.where(group["is_excluded"] == 0, 1)
         else:
-            baseline_status = current_status
+            adjusted_status = current_status
 
-        avail_excl = int(group.loc[baseline_status == 1, "duration_minutes_window"].sum())
+        avail_excl = int(group.loc[adjusted_status == 1, "duration_minutes_window"].sum())
 
         rows.append(
             {
@@ -1586,14 +1586,14 @@ def calculate_availability(
             "unavailable_minutes": 0,
             "missing_minutes": 0,
             "pct_available": 0.0,
-            "pct_unavailable": 0.0
+            "pct_unavailable": 0.0,
         }
 
     total = int(df["duration_minutes"].sum())
 
     status_series = df["est_disponible"].copy()
-    if include_exclusions and "previous_status" in df.columns:
-        status_series = df["previous_status"].where(df["is_excluded"] == 1, df["est_disponible"])
+    if include_exclusions and "is_excluded" in df.columns:
+        status_series = status_series.where(df["is_excluded"] == 0, 1)
 
     missing_minutes = int(df.loc[status_series == -1, "duration_minutes"].sum())
 
@@ -1614,7 +1614,7 @@ def calculate_availability(
         "unavailable_minutes": unavailable,
         "missing_minutes": missing_minutes,
         "pct_available": pct_available,
-        "pct_unavailable": pct_unavailable
+        "pct_unavailable": pct_unavailable,
     }
 
 
