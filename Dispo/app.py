@@ -1592,12 +1592,18 @@ def calculate_availability(
     status_series = df["est_disponible"].copy()
 
     if include_exclusions and "is_excluded" in df.columns:
-        if "previous_status" in df.columns:
-            status_series = status_series.where(df["is_excluded"] == 0, df["previous_status"])
-        elif "exclusion_mode" in df.columns:
-            as_avail = (df["is_excluded"] == 1) & (df["exclusion_mode"] == "as_available")
-            as_unav = (df["is_excluded"] == 1) & (df["exclusion_mode"] == "as_unavailable")
-            status_series = status_series.mask(as_avail, 1).mask(as_unav, 0)
+        status_series = status_series.copy()
+        mask_excluded = df["is_excluded"] == 1
+
+        if "exclusion_mode" in df.columns:
+            as_avail = mask_excluded & (df["exclusion_mode"] == "as_available")
+            as_unav = mask_excluded & (df["exclusion_mode"] == "as_unavailable")
+            status_series.loc[as_avail] = 1
+            status_series.loc[as_unav] = 0
+            mask_excluded = mask_excluded & ~(as_avail | as_unav)
+
+        if mask_excluded.any() and "previous_status" in df.columns:
+            status_series.loc[mask_excluded] = df.loc[mask_excluded, "previous_status"]
 
     missing_minutes = int(df.loc[status_series == -1, "duration_minutes"].sum())
     available = int(df.loc[status_series == 1, "duration_minutes"].sum())
