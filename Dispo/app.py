@@ -38,10 +38,6 @@ from Projects import mapping_sites
 from Binaire import get_equip_config, translate_ic_pc
 
 # Config
-# Time zone configuration
-APP_TIMEZONE = "Europe/Zurich"
-
-
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
@@ -629,7 +625,7 @@ def render_inline_delete_table(
 def invalidate_cache():
     """Invalide le cache de données."""
     st.cache_data.clear()
-    st.session_state["last_cache_clear"] = datetime.utcnow().isoformat()
+    st.session_state["last_cache_clear"] = datetime.now(timezone.utc).isoformat()
     logger.info("Cache invalidé")
 @st.cache_data(ttl=1800, show_spinner=False)
 def _list_ac_tables() -> pd.DataFrame:
@@ -1479,10 +1475,13 @@ def _normalize_blocks_df(df: pd.DataFrame) -> pd.DataFrame:
     for col in ["date_debut", "date_fin", "processed_at", "exclusion_applied_at"]:
         if col in out.columns:
             s = pd.to_datetime(out[col], errors="coerce")
-            if getattr(s.dt, "tz", None) is None:
-                s = s.dt.tz_localize(APP_TIMEZONE, nonexistent="shift_forward", ambiguous="NaT")
-            else:
-                s = s.dt.tz_convert(APP_TIMEZONE)
+            try:
+                if s.dt.tz is None:
+                    s = s.dt.tz_localize("Europe/Paris", nonexistent="shift_forward", ambiguous="NaT")
+                else:
+                    s = s.dt.tz_convert("Europe/Paris")
+            except Exception:
+                pass
             out[col] = s
     for col in [
         "est_disponible",
@@ -1532,8 +1531,8 @@ def _clip_block_durations(
     if df is None or df.empty:
         return df if df is not None else pd.DataFrame()
 
-    start_ts = _ensure_local_timestamp(start_dt)
-    end_ts = _ensure_local_timestamp(end_dt)
+    start_ts = _ensure_paris_timestamp(start_dt)
+    end_ts = _ensure_paris_timestamp(end_dt)
 
     if start_ts is None or end_ts is None:
         return df
@@ -1567,14 +1566,14 @@ def _aggregate_monthly_availability(
     end_p = pd.Timestamp(end_dt)
 
     if start_p.tz is None:
-        start_p = start_p.tz_localize(APP_TIMEZONE, nonexistent="shift_forward", ambiguous="NaT")
+        start_p = start_p.tz_localize("Europe/Paris", nonexistent="shift_forward", ambiguous="NaT")
     else:
-        start_p = start_p.tz_convert(APP_TIMEZONE)
+        start_p = start_p.tz_convert("Europe/Paris")
 
     if end_p.tz is None:
-        end_p = end_p.tz_localize(APP_TIMEZONE, nonexistent="shift_forward", ambiguous="NaT")
+        end_p = end_p.tz_localize("Europe/Paris", nonexistent="shift_forward", ambiguous="NaT")
     else:
-        end_p = end_p.tz_convert(APP_TIMEZONE)
+        end_p = end_p.tz_convert("Europe/Paris")
 
     df["clip_start"] = df["date_debut"].clip(lower=start_p)
     df["clip_end"] = df["date_fin"].clip(upper=end_p)
@@ -1743,7 +1742,7 @@ def _station_equipment_modes() -> List[Tuple[str, str]]:
     return equipments
 
 
-def _ensure_local_timestamp(value: Any) -> Optional[pd.Timestamp]:
+def _ensure_paris_timestamp(value: Any) -> Optional[pd.Timestamp]:
     if value is None or (isinstance(value, float) and pd.isna(value)):
         return None
     try:
@@ -1753,12 +1752,12 @@ def _ensure_local_timestamp(value: Any) -> Optional[pd.Timestamp]:
 
     try:
         if ts.tzinfo is None:
-            ts = ts.tz_localize(APP_TIMEZONE, nonexistent="shift_forward", ambiguous="infer")
+            ts = ts.tz_localize("Europe/Paris", nonexistent="shift_forward", ambiguous="infer")
         else:
-            ts = ts.tz_convert(APP_TIMEZONE)
+            ts = ts.tz_convert("Europe/Paris")
     except Exception:
         try:
-            ts = ts.tz_localize(APP_TIMEZONE, nonexistent="shift_forward", ambiguous="NaT")
+            ts = ts.tz_localize("Europe/Paris", nonexistent="shift_forward", ambiguous="NaT")
         except Exception:
             return None
 
@@ -1773,8 +1772,8 @@ def _build_station_timeline_df(timelines: Dict[str, pd.DataFrame]) -> pd.DataFra
         if df is None or df.empty:
             continue
         for _, row in df.iterrows():
-            start_ts = _ensure_local_timestamp(row.get("date_debut"))
-            end_ts = _ensure_local_timestamp(row.get("date_fin"))
+            start_ts = _ensure_paris_timestamp(row.get("date_debut"))
+            end_ts = _ensure_paris_timestamp(row.get("date_fin"))
             if start_ts is None or end_ts is None or end_ts <= start_ts:
                 continue
             records.append(
@@ -1888,8 +1887,8 @@ def _analyze_station_conditions(
     start_dt: datetime,
     end_dt: datetime,
 ) -> Dict[str, Any]:
-    start_ts = _ensure_local_timestamp(start_dt)
-    end_ts = _ensure_local_timestamp(end_dt)
+    start_ts = _ensure_paris_timestamp(start_dt)
+    end_ts = _ensure_paris_timestamp(end_dt)
 
     if start_ts is None or end_ts is None or end_ts <= start_ts:
         empty_df = pd.DataFrame()
@@ -1915,8 +1914,8 @@ def _analyze_station_conditions(
         equip_intervals: List[Tuple[pd.Timestamp, pd.Timestamp, int]] = []
         if df is not None and not df.empty:
             for _, row in df.iterrows():
-                raw_start = _ensure_local_timestamp(row.get("date_debut"))
-                raw_end = _ensure_local_timestamp(row.get("date_fin"))
+                raw_start = _ensure_paris_timestamp(row.get("date_debut"))
+                raw_end = _ensure_paris_timestamp(row.get("date_fin"))
                 if raw_start is None or raw_end is None:
                     continue
                 seg_start = max(raw_start, start_ts)
@@ -2115,7 +2114,7 @@ def _calculate_monthly_availability_equipment(
     end_dt: Optional[datetime] = None,
 ) -> pd.DataFrame:
     if not start_dt or not end_dt:
-        end_dt = datetime.utcnow()
+        end_dt = datetime.now(timezone.utc)
         start_dt = (end_dt.replace(day=1) - pd.DateOffset(months=months)).to_pydatetime()
 
     df = load_filtered_blocks(start_dt, end_dt, site, equip, mode=MODE_EQUIPMENT)
@@ -2135,7 +2134,7 @@ def _calculate_monthly_availability_pdc(
     end_dt: Optional[datetime] = None,
 ) -> pd.DataFrame:
     if not start_dt or not end_dt:
-        end_dt = datetime.utcnow()
+        end_dt = datetime.now(timezone.utc)
         start_dt = (end_dt.replace(day=1) - pd.DateOffset(months=months)).to_pydatetime()
 
     df = load_filtered_blocks(start_dt, end_dt, site, equip, mode=MODE_PDC)
@@ -3661,7 +3660,7 @@ def render_timeline_tab(site: Optional[str], equip: Optional[str], start_dt: dat
                     except Exception as exc:
                         st.error(f"❌ Impossible d'ajouter le commentaire : {exc}")
     with st.expander("⚡ Exclusion rapide des données manquantes", expanded=False):
-        month_default = datetime.utcnow().date().replace(day=1)
+        month_default = datetime.now(timezone.utc).date().replace(day=1)
         month_candidates = [
             ts.to_pydatetime().date() for ts in pd.date_range(end=month_default, periods=12, freq="MS")
         ]
@@ -3845,8 +3844,8 @@ def render_exclusions_tab():
                 parts.append(f"{minutes} min")
             return " ".join(parts)
 
-        now_ts = pd.Timestamp.utcnow()
-        applied_ts = pd.to_datetime(df_active["applied_at"], errors="coerce")
+        now_ts = pd.Timestamp.now(tz='UTC')
+        applied_ts = pd.to_datetime(df_active["applied_at"], errors="coerce", utc=True)
 
         df_active_display = pd.DataFrame(
             {
