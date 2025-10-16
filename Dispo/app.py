@@ -7,7 +7,7 @@ from datetime import datetime, time, timedelta, timezone
 from itertools import cycle
 from typing import Any, Dict, Optional, List, Tuple, Set, Callable
 import logging
-
+from zoneinfo import ZoneInfo
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
@@ -52,6 +52,17 @@ MODE_LABELS = {
 }
 GENERIC_SCOPE_TOKENS = ("tous", "toutes", "all", "global", "ensemble", "général", "general")
 
+def _format_timestamp_display(value: Any) -> str:
+    if isinstance(value, pd.Timestamp):
+        if value.tzinfo is not None:
+            value = value.tz_convert('Europe/Zurich').tz_localize(None)
+        return value.strftime("%Y-%m-%d %H:%M:%S")
+    if isinstance(value, datetime):
+        if value.tzinfo is not None:
+            from zoneinfo import ZoneInfo
+            value = value.astimezone(ZoneInfo('Europe/Zurich')).replace(tzinfo=None)
+        return value.strftime("%Y-%m-%d %H:%M:%S")
+    return str(value)
 
 def get_current_mode() -> str:
     return st.session_state.get("app_mode", MODE_EQUIPMENT)
@@ -3687,7 +3698,10 @@ def render_timeline_tab(site: Optional[str], equip: Optional[str], start_dt: dat
                                 st.balloons()
                                 st.rerun()
 
-            st.markdown(f"**Bloc sélectionné:** {selected_row['start']} → {selected_row['end']}")
+            start_display = _format_timestamp_display(selected_row["start"])
+            end_display = _format_timestamp_display(selected_row["end"])
+            st.markdown(f"**Bloc sélectionné:** {start_display} → {end_display}")
+            
             if est_val != 1: 
                 cause_originale = selected_row.get("cause", "Non spécifié")
                 equip_current = st.session_state.get("current_equip")
@@ -3759,7 +3773,7 @@ def render_timeline_tab(site: Optional[str], equip: Optional[str], start_dt: dat
                     except Exception as exc:
                         st.error(f"❌ Impossible d'ajouter le commentaire : {exc}")
     with st.expander("⚡ Exclusion rapide des données manquantes", expanded=False):
-        month_default = datetime.now(timezone.utc).date().replace(day=1)
+        month_default = datetime.now(ZoneInfo("Europe/Zurich")).date().replace(day=1)
         month_candidates = [
             ts.to_pydatetime().date() for ts in pd.date_range(end=month_default, periods=12, freq="MS")
         ]
@@ -4113,8 +4127,19 @@ def render_exclusions_tab():
         history["Statut"] = history["released_at"].apply(lambda v: "✅ Active" if pd.isna(v) else "❌ Levée")
         status_map = {1: "Disponible", 0: "Indisponible", -1: "Donnée manquante"}
         history["Statut initial"] = history["previous_status"].map(status_map).fillna("Inconnu")
-        history["Appliquée le"] = pd.to_datetime(history["applied_at"]).dt.strftime("%Y-%m-%d %H:%M")
-        history["Levée le"] = pd.to_datetime(history["released_at"]).dt.strftime("%Y-%m-%d %H:%M")
+        
+        # ➕ Conversion en heure de Zurich
+        history["Appliquée le"] = (
+            pd.to_datetime(history["applied_at"], utc=True)
+            .dt.tz_convert('Europe/Zurich')
+            .dt.strftime("%Y-%m-%d %H:%M")
+        )
+        history["Levée le"] = (
+            pd.to_datetime(history["released_at"], utc=True)
+            .dt.tz_convert('Europe/Zurich')
+            .dt.strftime("%Y-%m-%d %H:%M")
+        )
+        
         display_cols = [
             "id",
             "table_name",
