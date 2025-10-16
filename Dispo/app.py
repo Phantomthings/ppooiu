@@ -3543,11 +3543,18 @@ def render_timeline_tab(site: Optional[str], equip: Optional[str], start_dt: dat
 
     with st.expander("⚡ Exclusion rapide des données manquantes", expanded=False):
         month_default = datetime.utcnow().date().replace(day=1)
-        target_month = st.date_input(
+        month_candidates = [
+            ts.to_pydatetime().date() for ts in pd.date_range(end=month_default, periods=12, freq="MS")
+        ]
+        month_candidates.reverse()
+        default_index = month_candidates.index(month_default) if month_default in month_candidates else 0
+        target_month = st.selectbox(
             "Mois concerné",
-            value=month_default,
+            options=month_candidates,
+            index=default_index,
+            format_func=lambda d: d.strftime("%Y-%m"),
             key="timeline_missing_month_picker",
-            help="Choisissez une date dans le mois pour exclure automatiquement toutes les données manquantes.",
+            help="Choisissez un mois pour exclure automatiquement toutes les données manquantes.",
         )
 
         month_start = target_month.replace(day=1)
@@ -3555,6 +3562,17 @@ def render_timeline_tab(site: Optional[str], equip: Optional[str], start_dt: dat
             next_month = month_start.replace(year=month_start.year + 1, month=1)
         else:
             next_month = month_start.replace(month=month_start.month + 1)
+
+        st.markdown("**Sites concernés par l'exclusion automatique**")
+        exclusion_sites = ["AC", "DC1", "DC2", "PDC1", "PDC2", "PDC3", "PDC4", "PDC5", "PDC6"]
+        site_columns = st.columns(3)
+        selected_sites = []
+        for idx, site_label in enumerate(exclusion_sites):
+            col = site_columns[idx % len(site_columns)]
+            if col.checkbox(site_label, key=f"timeline_missing_site_{site_label.lower()}"):
+                selected_sites.append(site_label)
+
+        st.session_state["timeline_missing_selected_sites"] = selected_sites
 
         default_comment = f"Exclusion automatique données manquantes {month_start.strftime('%Y-%m')}"
         bulk_comment = st.text_input(
