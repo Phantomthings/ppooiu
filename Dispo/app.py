@@ -625,7 +625,7 @@ def render_inline_delete_table(
 def invalidate_cache():
     """Invalide le cache de données."""
     st.cache_data.clear()
-    st.session_state["last_cache_clear"] = datetime.utcnow().isoformat()
+    st.session_state["last_cache_clear"] = datetime.isoformat()
     logger.info("Cache invalidé")
 @st.cache_data(ttl=1800, show_spinner=False)
 def _list_ac_tables() -> pd.DataFrame:
@@ -2114,7 +2114,7 @@ def _calculate_monthly_availability_equipment(
     end_dt: Optional[datetime] = None,
 ) -> pd.DataFrame:
     if not start_dt or not end_dt:
-        end_dt = datetime.utcnow()
+        end_dt = datetime
         start_dt = (end_dt.replace(day=1) - pd.DateOffset(months=months)).to_pydatetime()
 
     df = load_filtered_blocks(start_dt, end_dt, site, equip, mode=MODE_EQUIPMENT)
@@ -2134,7 +2134,7 @@ def _calculate_monthly_availability_pdc(
     end_dt: Optional[datetime] = None,
 ) -> pd.DataFrame:
     if not start_dt or not end_dt:
-        end_dt = datetime.utcnow()
+        end_dt = datetime
         start_dt = (end_dt.replace(day=1) - pd.DateOffset(months=months)).to_pydatetime()
 
     df = load_filtered_blocks(start_dt, end_dt, site, equip, mode=MODE_PDC)
@@ -3612,7 +3612,7 @@ def render_timeline_tab(site: Optional[str], equip: Optional[str], start_dt: dat
                     st.rerun()
 
     with st.expander("⚡ Exclusion rapide des données manquantes", expanded=False):
-        month_default = datetime.utcnow().date().replace(day=1)
+        month_default = datetime.date().replace(day=1)
         month_candidates = [
             ts.to_pydatetime().date() for ts in pd.date_range(end=month_default, periods=12, freq="MS")
         ]
