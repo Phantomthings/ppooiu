@@ -1495,12 +1495,12 @@ def _aggregate_monthly_availability(
         current_status = group["est_disponible"]
         avail_brut = int(group.loc[current_status == 1, "duration_minutes_window"].sum())
 
-        if "is_excluded" in group.columns:
-            adjusted_status = current_status.where(group["is_excluded"] == 0, 1)
+        if "previous_status" in group.columns:
+            baseline_status = group["previous_status"].where(group["is_excluded"] == 1, current_status)
         else:
-            adjusted_status = current_status
+            baseline_status = current_status
 
-        avail_excl = int(group.loc[adjusted_status == 1, "duration_minutes_window"].sum())
+        avail_excl = int(group.loc[baseline_status == 1, "duration_minutes_window"].sum())
 
         rows.append(
             {
@@ -1577,7 +1577,6 @@ def calculate_availability(
     df: Optional[pd.DataFrame],
     include_exclusions: bool = False
 ) -> Dict[str, float]:
-    """Calcule les métriques de disponibilité."""
     if df is None or df.empty:
         return {
             "total_minutes": 0,
@@ -1590,18 +1589,19 @@ def calculate_availability(
         }
 
     total = int(df["duration_minutes"].sum())
-
     status_series = df["est_disponible"].copy()
+
     if include_exclusions and "is_excluded" in df.columns:
-        status_series = status_series.where(df["is_excluded"] == 0, 1)
+        if "previous_status" in df.columns:
+            status_series = status_series.where(df["is_excluded"] == 0, df["previous_status"])
+        elif "exclusion_mode" in df.columns:
+            as_avail = (df["is_excluded"] == 1) & (df["exclusion_mode"] == "as_available")
+            as_unav = (df["is_excluded"] == 1) & (df["exclusion_mode"] == "as_unavailable")
+            status_series = status_series.mask(as_avail, 1).mask(as_unav, 0)
 
     missing_minutes = int(df.loc[status_series == -1, "duration_minutes"].sum())
-
-    available_mask = status_series == 1
-    unavailable_mask = status_series == 0
-
-    available = int(df.loc[available_mask, "duration_minutes"].sum())
-    unavailable = int(df.loc[unavailable_mask, "duration_minutes"].sum())
+    available = int(df.loc[status_series == 1, "duration_minutes"].sum())
+    unavailable = int(df.loc[status_series == 0, "duration_minutes"].sum())
     effective_total = available + unavailable
 
     pct_available = (available / effective_total * 100) if effective_total > 0 else 0.0
