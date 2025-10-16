@@ -1,23 +1,19 @@
-
-+4288
--4381
-
-#app.py#k
-import math#k
-import os#k
-import re#k
-from dataclasses import dataclass#k
-from datetime import datetime, time, timedelta, timezone#k
-from itertools import cycle#k
+#app.py
+import math
+import os
+import re
+from dataclasses import dataclass
+from datetime import datetime, time, timedelta, timezone
+from itertools import cycle
 from typing import Any, Dict, Optional, List, Tuple, Set, Callable
-import logging#k
-#k
-import pandas as pd#k
-import plotly.express as px#k
-import plotly.graph_objects as go#k
-import streamlit as st#k
-from sqlalchemy import create_engine, text
-from sqlalchemy.exc import SQLAlchemyError
+import logging
+
+import pandas as pd
+import plotly.express as px
+import plotly.graph_objects as go
+import streamlit as st
+from sqlalchemy import create_engine, text, inspect
+from sqlalchemy.exc import NoSuchTableError, SQLAlchemyError
 
 
 class ExclusionError(RuntimeError):
@@ -38,147 +34,147 @@ class ExclusionActionResult:
 
 
 _TABLE_NAME_PATTERN = re.compile(r"^[A-Za-z0-9_]+$")
-from Projects import mapping_sites#k
-from Binaire import get_equip_config, translate_ic_pc#k
-#k
-# Config#k
-logging.basicConfig(#k
-    level=logging.INFO,#k
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'#k
-)#k
-logger = logging.getLogger(__name__)#k
-#k
-MODE_EQUIPMENT = "equip"#k
-MODE_PDC = "pdc"#k
-MODE_LABELS = {#k
-    MODE_EQUIPMENT: "Disponibilité équipements",#k
-    MODE_PDC: "Disponibilité points de charge",#k
-}#k
-GENERIC_SCOPE_TOKENS = ("tous", "toutes", "all", "global", "ensemble", "général", "general")#k
-#k
-#k
-def get_current_mode() -> str:#k
-    return st.session_state.get("app_mode", MODE_EQUIPMENT)#k
-#k
-#k
-def set_current_mode(mode: str) -> None:#k
-    if mode not in MODE_LABELS:#k
-        mode = MODE_EQUIPMENT#k
-    st.session_state["app_mode"] = mode#k
-#k
-st.set_page_config(#k
-    layout="wide",#k
-    page_title="Disponibilité Équipements",#k
-    page_icon="📊",#k
-    initial_sidebar_state="expanded"#k
-)#k
-#k
-st.markdown("""#k
-<style>#k
-  .stMetric {#k
-      background-color: #f0f2f6;#k
-      padding: 12px;#k
-      border-radius: 10px;#k
-      box-shadow: 0 2px 4px rgba(0,0,0,0.1);#k
-  }#k
-  .stMetric label {#k
-      font-weight: 400;#k
-      color: #1f77b4;#k
-  }#k
-  div[data-testid="stExpander"] {#k
-      background-color: #ffffff;#k
-      border: 1px solid #e0e0e0;#k
-      border-radius: 5px;#k
-  }#k
-  .success-box {#k
-      padding: 10px;#k
-      background-color: #d4edda;#k
-      border-left: 4px solid #28a745;#k
-      margin: 10px 0;#k
-  }#k
-  .warning-box {#k
-      padding: 10px;#k
-      background-color: #fff3cd;#k
-      border-left: 4px solid #ffc107;#k
-      margin: 10px 0;#k
-  }#k
-  .error-box {#k
-      padding: 10px;#k
-      background-color: #f8d7da;#k
-      border-left: 4px solid #dc3545;#k
-      margin: 10px 0;#k
-  }#k
-#k
-  div[data-testid="stMetricValue"] { font-size: 1.47rem !important; line-height: 1.2; }#k
-  div[data-testid="stMetricDelta"] { font-size: 0.85rem !important; line-height: 1.1; }#k
-  div[data-testid="stMetricLabel"] > div { font-size: 1.35rem !important; }#k
-</style>#k
-""", unsafe_allow_html=True)#k
-#k
-# Config#k
-def get_db_config() -> Dict[str, str]:#k
-    return {#k
-        "user": st.secrets.get("MYSQL_USER", os.getenv("MYSQL_USER", "AdminNidec")),#k
-        "password": st.secrets.get("MYSQL_PASSWORD", os.getenv("MYSQL_PASSWORD", "u6Ehe987XBSXxa4")),#k
-        "host": st.secrets.get("MYSQL_HOST", os.getenv("MYSQL_HOST", "141.94.31.144")),#k
-        "port": int(st.secrets.get("MYSQL_PORT", os.getenv("MYSQL_PORT", 3306))),#k
-        "database": st.secrets.get("MYSQL_DB", os.getenv("MYSQL_DB", "indicator"))#k
-    }#k
-#k
-@st.cache_resource#k
-def get_engine():#k
-    """Crée et retourne l'engine SQLAlchemy avec gestion d'erreurs."""#k
-    try:#k
-        config = get_db_config()#k
-        engine_uri = (#k
-            f"mysql+pymysql://{config['user']}:{config['password']}"#k
-            f"@{config['host']}:{config['port']}/{config['database']}"#k
-            f"?charset=utf8mb4"#k
-        )#k
-        engine = create_engine(#k
-            engine_uri,#k
-            pool_pre_ping=True,#k
-            pool_recycle=3600,#k
-            pool_size=5,#k
-            max_overflow=10,#k
-            echo=False#k
-        )#k
-        # Test de connexion#k
-        with engine.connect() as conn:#k
-            conn.execute(text("SELECT 1"))#k
-        logger.info("Connexion à la base de données établie avec succès")#k
-        return engine#k
-    except Exception as e:#k
-        logger.error(f"Erreur de connexion à la base de données: {e}")#k
-        st.error(f"❌ Impossible de se connecter à la base de données: {e}")#k
-        st.stop()#k
-#k
-# Couche Données#k
-class DatabaseError(Exception):#k
-    pass#k
-#k
-@st.cache_data(ttl=1800, show_spinner=False)#k
-def execute_query(query: str, params: Optional[Dict] = None) -> pd.DataFrame:#k
-    try:#k
-        engine = get_engine()#k
-        with engine.connect() as conn:#k
-            if "dispo_blocs_exclusions" in query:#k
-                try:#k
-                    _ensure_exclusion_table(conn)#k
-                except SQLAlchemyError as ensure_exc:#k
-                    logger.warning(#k
-                        "Impossible de créer la table des exclusions avant la requête: %s",#k
-                        ensure_exc,#k
-                    )#k
-            df = pd.read_sql_query(text(query), conn, params=params or {})#k
-        return df#k
-    except SQLAlchemyError as e:#k
-        logger.error(f"Erreur SQL: {e}")#k
-        raise DatabaseError(f"Erreur lors de l'exécution de la requête: {str(e)}")#k
-    except Exception as e:#k
-        logger.error(f"Erreur inattendue: {e}")#k
-        raise DatabaseError(f"Erreur inattendue: {str(e)}")#k
-#k
+from Projects import mapping_sites
+from Binaire import get_equip_config, translate_ic_pc
+
+# Config
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
+
+MODE_EQUIPMENT = "equip"
+MODE_PDC = "pdc"
+MODE_LABELS = {
+    MODE_EQUIPMENT: "Disponibilité équipements",
+    MODE_PDC: "Disponibilité points de charge",
+}
+GENERIC_SCOPE_TOKENS = ("tous", "toutes", "all", "global", "ensemble", "général", "general")
+
+
+def get_current_mode() -> str:
+    return st.session_state.get("app_mode", MODE_EQUIPMENT)
+
+
+def set_current_mode(mode: str) -> None:
+    if mode not in MODE_LABELS:
+        mode = MODE_EQUIPMENT
+    st.session_state["app_mode"] = mode
+
+st.set_page_config(
+    layout="wide",
+    page_title="Disponibilité Équipements",
+    page_icon="📊",
+    initial_sidebar_state="expanded"
+)
+
+st.markdown("""
+<style>
+  .stMetric {
+      background-color: #f0f2f6;
+      padding: 12px;
+      border-radius: 10px;
+      box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+  }
+  .stMetric label {
+      font-weight: 400;
+      color: #1f77b4;
+  }
+  div[data-testid="stExpander"] {
+      background-color: #ffffff;
+      border: 1px solid #e0e0e0;
+      border-radius: 5px;
+  }
+  .success-box {
+      padding: 10px;
+      background-color: #d4edda;
+      border-left: 4px solid #28a745;
+      margin: 10px 0;
+  }
+  .warning-box {
+      padding: 10px;
+      background-color: #fff3cd;
+      border-left: 4px solid #ffc107;
+      margin: 10px 0;
+  }
+  .error-box {
+      padding: 10px;
+      background-color: #f8d7da;
+      border-left: 4px solid #dc3545;
+      margin: 10px 0;
+  }
+
+  div[data-testid="stMetricValue"] { font-size: 1.47rem !important; line-height: 1.2; }
+  div[data-testid="stMetricDelta"] { font-size: 0.85rem !important; line-height: 1.1; }
+  div[data-testid="stMetricLabel"] > div { font-size: 1.35rem !important; }
+</style>
+""", unsafe_allow_html=True)
+
+# Config
+def get_db_config() -> Dict[str, str]:
+    return {
+        "user": st.secrets.get("MYSQL_USER", os.getenv("MYSQL_USER", "AdminNidec")),
+        "password": st.secrets.get("MYSQL_PASSWORD", os.getenv("MYSQL_PASSWORD", "u6Ehe987XBSXxa4")),
+        "host": st.secrets.get("MYSQL_HOST", os.getenv("MYSQL_HOST", "141.94.31.144")),
+        "port": int(st.secrets.get("MYSQL_PORT", os.getenv("MYSQL_PORT", 3306))),
+        "database": st.secrets.get("MYSQL_DB", os.getenv("MYSQL_DB", "indicator"))
+    }
+
+@st.cache_resource
+def get_engine():
+    """Crée et retourne l'engine SQLAlchemy avec gestion d'erreurs."""
+    try:
+        config = get_db_config()
+        engine_uri = (
+            f"mysql+pymysql://{config['user']}:{config['password']}"
+            f"@{config['host']}:{config['port']}/{config['database']}"
+            f"?charset=utf8mb4"
+        )
+        engine = create_engine(
+            engine_uri,
+            pool_pre_ping=True,
+            pool_recycle=3600,
+            pool_size=5,
+            max_overflow=10,
+            echo=False
+        )
+        # Test de connexion
+        with engine.connect() as conn:
+            conn.execute(text("SELECT 1"))
+        logger.info("Connexion à la base de données établie avec succès")
+        return engine
+    except Exception as e:
+        logger.error(f"Erreur de connexion à la base de données: {e}")
+        st.error(f"❌ Impossible de se connecter à la base de données: {e}")
+        st.stop()
+
+# Couche Données
+class DatabaseError(Exception):
+    pass
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def execute_query(query: str, params: Optional[Dict] = None) -> pd.DataFrame:
+    try:
+        engine = get_engine()
+        with engine.connect() as conn:
+            if "dispo_blocs_exclusions" in query:
+                try:
+                    _ensure_exclusion_table(conn)
+                except SQLAlchemyError as ensure_exc:
+                    logger.warning(
+                        "Impossible de créer la table des exclusions avant la requête: %s",
+                        ensure_exc,
+                    )
+            df = pd.read_sql_query(text(query), conn, params=params or {})
+        return df
+    except SQLAlchemyError as e:
+        logger.error(f"Erreur SQL: {e}")
+        raise DatabaseError(f"Erreur lors de l'exécution de la requête: {str(e)}")
+    except Exception as e:
+        logger.error(f"Erreur inattendue: {e}")
+        raise DatabaseError(f"Erreur inattendue: {str(e)}")
+
 def execute_write(query: str, params: Optional[Dict] = None) -> bool:
     """Exécute une requête d'écriture (INSERT, UPDATE, DELETE)."""
     try:
@@ -240,9 +236,10 @@ def _ensure_reclassification_history_table(conn) -> None:
 def _fetch_block_status(conn, table_name: str, block_id: int) -> int:
     """Return the current est_disponible value for the block."""
 
+    status_column = _resolve_status_column(conn, table_name)
     select_stmt = text(
         f"""
-        SELECT est_disponible
+        SELECT {status_column}
         FROM `{table_name}`
         WHERE id = :block_id
         """
@@ -254,12 +251,43 @@ def _fetch_block_status(conn, table_name: str, block_id: int) -> int:
         )
 
     try:
-        return int(row["est_disponible"])
+        return int(row[status_column])
     except (TypeError, ValueError) as exc:
         raise ExclusionError(
             f"Valeur 'est_disponible' invalide pour le bloc {block_id}."
         ) from exc
 
+
+_STATUS_COLUMN_CACHE: Dict[str, str] = {}
+_STATUS_COLUMN_CANDIDATES: Tuple[str, ...] = ("est_disponible", "etat")
+
+
+def _resolve_status_column(conn, table_name: str) -> str:
+    """Return the name of the status column for the given table."""
+
+    if table_name in _STATUS_COLUMN_CACHE:
+        return _STATUS_COLUMN_CACHE[table_name]
+
+    inspector = inspect(conn)
+    try:
+        columns = {col["name"] for col in inspector.get_columns(table_name)}
+    except NoSuchTableError as exc:
+        raise ExclusionError(
+            f"Table {table_name} introuvable lors de la résolution de la colonne de statut."
+        ) from exc
+    except SQLAlchemyError as exc:  # pragma: no cover - safety net
+        raise ExclusionError(
+            f"Impossible de déterminer la colonne de statut pour {table_name}: {exc}"
+        ) from exc
+
+    for candidate in _STATUS_COLUMN_CANDIDATES:
+        if candidate in columns:
+            _STATUS_COLUMN_CACHE[table_name] = candidate
+            return candidate
+
+    raise ExclusionError(
+        f"La table {table_name} ne contient aucune colonne de statut reconnue ({', '.join(_STATUS_COLUMN_CANDIDATES)})."
+    )
 
 def _is_valid_table_name(table_name: str) -> bool:
     return bool(_TABLE_NAME_PATTERN.match(table_name))
@@ -533,239 +561,239 @@ def delete_annotation(annotation_id: int) -> bool:
     query = "DELETE FROM dispo_annotations WHERE id = :id"
     params = {"id": annotation_id}
     return execute_write(query, params)
-#k
-#k
+
+
 def render_inline_delete_table(
-    df: pd.DataFrame,#k
-    *,#k
-    column_settings: List[Tuple[str, str, float]],#k
-    key_prefix: str,#k
-    delete_handler: Callable[[int], bool],#k
-    success_message: str,#k
-    error_message: str,#k
-) -> None:#k
-    """Affiche un tableau avec une action de suppression en ligne pour chaque ligne."""#k
+    df: pd.DataFrame,
+    *,
+    column_settings: List[Tuple[str, str, float]],
+    key_prefix: str,
+    delete_handler: Callable[[int], bool],
+    success_message: str,
+    error_message: str,
+) -> None:
+    """Affiche un tableau avec une action de suppression en ligne pour chaque ligne."""
 
-    if df.empty:#k
-        st.info("ℹ️ Aucun enregistrement à afficher.")#k
-        return#k
+    if df.empty:
+        st.info("ℹ️ Aucun enregistrement à afficher.")
+        return
 
-    widths = [max(width, 0.5) for _, _, width in column_settings]#k
-    action_width = 0.7#k
+    widths = [max(width, 0.5) for _, _, width in column_settings]
+    action_width = 0.7
 
-    header_cols = st.columns(widths + [action_width])#k
-    for col, (_, label, _) in enumerate(column_settings):#k
-        header_cols[col].markdown(f"**{label}**")#k
-    header_cols[-1].markdown("**Actions**")#k
+    header_cols = st.columns(widths + [action_width])
+    for col, (_, label, _) in enumerate(column_settings):
+        header_cols[col].markdown(f"**{label}**")
+    header_cols[-1].markdown("**Actions**")
 
-    for idx, row in df.iterrows():#k
-        cols = st.columns(widths + [action_width])#k
-        row_dict = row.to_dict()#k
+    for idx, row in df.iterrows():
+        cols = st.columns(widths + [action_width])
+        row_dict = row.to_dict()
 
-        for col, (col_name, _, _) in enumerate(column_settings):#k
-            value = row_dict.get(col_name, "")#k
-            display_value = "—" if pd.isna(value) or value == "" else value#k
-            cols[col].write(display_value)#k
+        for col, (col_name, _, _) in enumerate(column_settings):
+            value = row_dict.get(col_name, "")
+            display_value = "—" if pd.isna(value) or value == "" else value
+            cols[col].write(display_value)
 
-        delete_key = f"{key_prefix}_delete_{row_dict.get('id', idx)}_{idx}"#k
+        delete_key = f"{key_prefix}_delete_{row_dict.get('id', idx)}_{idx}"
 
-        if cols[-1].button("🗑️", key=delete_key):#k
-            with st.spinner("Suppression en cours..."):#k
-                try:#k
-                    identifier = int(row_dict.get("id"))#k
-                except (TypeError, ValueError):#k
-                    identifier = None#k
+        if cols[-1].button("🗑️", key=delete_key):
+            with st.spinner("Suppression en cours..."):
+                try:
+                    identifier = int(row_dict.get("id"))
+                except (TypeError, ValueError):
+                    identifier = None
 
-                success = False#k
-                if identifier is not None:#k
-                    try:#k
-                        success = bool(delete_handler(identifier))#k
-                    except Exception as exc:  # pragma: no cover - sécurité UI#k
-                        logger.exception("Erreur lors de la suppression: %s", exc)#k
+                success = False
+                if identifier is not None:
+                    try:
+                        success = bool(delete_handler(identifier))
+                    except Exception as exc:  # pragma: no cover - sécurité UI
+                        logger.exception("Erreur lors de la suppression: %s", exc)
 
-                message_context = {k: row_dict.get(k) for k, _, _ in column_settings}#k
-                message_context.update(row_dict)#k
+                message_context = {k: row_dict.get(k) for k, _, _ in column_settings}
+                message_context.update(row_dict)
 
-                if success:#k
-                    st.success(success_message.format(**message_context))#k
-                    invalidate_cache()#k
-                    st.rerun()#k
-                else:#k
-                    st.error(error_message.format(**message_context))#k
-#k
-#k
-def invalidate_cache():#k
-    """Invalide le cache de données."""#k
-    st.cache_data.clear()#k
-    st.session_state["last_cache_clear"] = datetime.utcnow().isoformat()#k
-    logger.info("Cache invalidé")#k
-@st.cache_data(ttl=1800, show_spinner=False)#k
-def _list_ac_tables() -> pd.DataFrame:#k
-    """#k
-    Retourne un DF avec colonnes: site_code, table_name#k
-    pour toutes les tables dispo_blocs_ac_<site> du schéma.#k
-    """#k
-    q = """#k
-    SELECT TABLE_NAME AS table_name#k
-    FROM information_schema.tables#k
-    WHERE TABLE_SCHEMA = :db#k
-      AND TABLE_NAME REGEXP '^dispo_blocs_ac_[0-9]+(_[0-9]+)?$'#k
-    ORDER BY TABLE_NAME#k
-    """#k
-    df = execute_query(q, {"db": get_db_config()["database"]})#k
-    if df.empty:#k
-        return pd.DataFrame(columns=["site_code", "table_name"])#k
-#k
-    df.columns = [c.lower() for c in df.columns]#k
-    if "table_name" not in df.columns:#k
-        return pd.DataFrame(columns=["site_code", "table_name"])#k
-#k
-    def _parse(tbl: str) -> pd.Series:#k
-        t = str(tbl)#k
-        if t.startswith("dispo_blocs_ac_"):#k
-            return pd.Series([t[len("dispo_blocs_ac_"):], t])#k
-        return pd.Series([None, t])#k
-#k
-    out = df["table_name"].apply(_parse)#k
-    out.columns = ["site_code", "table_name"]#k
-    return out.dropna(subset=["site_code"]).reset_index(drop=True)#k
-#k
-#k
-@st.cache_data(ttl=1800, show_spinner=False)#k
-def _list_pdc_tables() -> pd.DataFrame:#k
-    q = """#k
-    SELECT TABLE_NAME AS table_name#k
-    FROM information_schema.tables#k
-    WHERE TABLE_SCHEMA = :db#k
-      AND TABLE_NAME REGEXP '^dispo_pdc_n[0-9]+_[0-9]+(_[0-9]+)?$'#k
-    ORDER BY TABLE_NAME#k
-    """#k
-    df = execute_query(q, {"db": get_db_config()["database"]})#k
-    if df.empty:#k
-        return pd.DataFrame(columns=["site_code", "pdc_id", "table_name"])#k
-#k
-    df.columns = [c.lower() for c in df.columns]#k
-    if "table_name" not in df.columns:#k
-        return pd.DataFrame(columns=["site_code", "pdc_id", "table_name"])#k
-#k
-    def _parse(tbl: str) -> pd.Series:#k
-        t = str(tbl)#k
-        prefix = "dispo_pdc_"#k
-        if not t.startswith(prefix):#k
-            return pd.Series([None, None, t])#k
-        payload = t[len(prefix):]#k
-        parts = payload.split("_", 1)#k
-        if len(parts) != 2:#k
-            return pd.Series([None, None, t])#k
-        num = parts[0].lstrip("nN")#k
-        pdc_id = f"PDC{num}" if num else None#k
-        return pd.Series([parts[1], pdc_id, t])#k
-#k
-    out = df["table_name"].apply(_parse)#k
-    out.columns = ["site_code", "pdc_id", "table_name"]#k
-    return out.dropna(subset=["site_code", "pdc_id"]).reset_index(drop=True)#k
-#k
-def _sanitize_scope_options(options: List[str]) -> List[str]:#k
-    """Supprime les entrées génériques (tous/global) d'une liste."""#k
-    cleaned: List[str] = []#k
-    for value in options:#k
-        if value is None:#k
-            continue#k
-        text = str(value).strip()#k
-        if not text:#k
-            continue#k
-        lowered = text.lower()#k
-        if any(token in lowered for token in ("tous", "toutes", "all", "global", "ensemble")):#k
-            continue#k
-        cleaned.append(text)#k
-    return cleaned#k
-#k
-#k
-def get_sites(mode: str = MODE_EQUIPMENT) -> List[str]:#k
-    """Récupère la liste des sites en fonction du mode sélectionné."""#k
-    if mode == MODE_PDC:#k
-        try:#k
-            pdc = _list_pdc_tables()#k
-        except DatabaseError:#k
-            pdc = pd.DataFrame(columns=["site_code"])#k
-        if pdc.empty:#k
-            return []#k
-        return sorted(_sanitize_scope_options(pdc["site_code"].unique().tolist()))#k
-#k
-    try:#k
-        ac = _list_ac_tables()#k
-    except DatabaseError:#k
-        ac = pd.DataFrame(columns=["site_code"])#k
-    try:#k
-        bt = _list_batt_tables()#k
-    except DatabaseError:#k
-        bt = pd.DataFrame(columns=["site_code", "kind", "table_name"])#k
-#k
-    ac_sites = set(ac["site_code"].tolist()) if not ac.empty else set()#k
-    bt_sites = set(bt["site_code"].tolist()) if not bt.empty else set()#k
-    return sorted(_sanitize_scope_options(list(ac_sites.union(bt_sites))))#k
-#k
-#k
-def get_equipments(mode: str = MODE_EQUIPMENT, site: Optional[str] = None) -> List[str]:#k
-    if mode == MODE_PDC:#k
-        pdc_tbls = _list_pdc_tables()#k
-        if pdc_tbls.empty:#k
-            return []#k
-        if site:#k
-            subset = pdc_tbls[pdc_tbls["site_code"] == site]#k
-        else:#k
-            subset = pdc_tbls#k
-        return sorted(_sanitize_scope_options(subset["pdc_id"].unique().tolist()))#k
-#k
-    equips = set()#k
-    ac_tbls = _list_ac_tables()#k
-    bt_tbls = _list_batt_tables()#k
-#k
-    if site:#k
-        if not ac_tbls.empty and (ac_tbls["site_code"] == site).any():#k
-            equips.add("AC")#k
-        if not bt_tbls.empty and ((bt_tbls["site_code"] == site) & (bt_tbls["kind"] == "batt")).any():#k
-            equips.add("DC1")#k
-        if not bt_tbls.empty and ((bt_tbls["site_code"] == site) & (bt_tbls["kind"] == "batt2")).any():#k
-            equips.add("DC2")#k
-    else:#k
-        if not ac_tbls.empty:#k
-            equips.add("AC")#k
-        if not bt_tbls.empty and (bt_tbls["kind"] == "batt").any():#k
-            equips.add("DC1")#k
-        if not bt_tbls.empty and (bt_tbls["kind"] == "batt2").any():#k
-            equips.add("DC2")#k
-#k
-    return sorted(_sanitize_scope_options(list(equips)))#k
-#k
-#k
-def _load_blocks_equipment(site: str, equip: str, start_dt: datetime, end_dt: datetime) -> pd.DataFrame:#k
-    params = {"site": site, "equip": equip, "start": start_dt, "end": end_dt}#k
-    try:#k
-        q_view = """#k
-            SELECT *#k
-            FROM dispo_blocs_with_exclusion_flag#k
-            WHERE site = :site#k
-              AND equipement_id = :equip#k
-              AND date_debut < :end#k
-              AND date_fin   > :start#k
-            ORDER BY date_debut#k
-        """#k
+                if success:
+                    st.success(success_message.format(**message_context))
+                    invalidate_cache()
+                    st.rerun()
+                else:
+                    st.error(error_message.format(**message_context))
+
+
+def invalidate_cache():
+    """Invalide le cache de données."""
+    st.cache_data.clear()
+    st.session_state["last_cache_clear"] = datetime.utcnow().isoformat()
+    logger.info("Cache invalidé")
+@st.cache_data(ttl=1800, show_spinner=False)
+def _list_ac_tables() -> pd.DataFrame:
+    """
+    Retourne un DF avec colonnes: site_code, table_name
+    pour toutes les tables dispo_blocs_ac_<site> du schéma.
+    """
+    q = """
+    SELECT TABLE_NAME AS table_name
+    FROM information_schema.tables
+    WHERE TABLE_SCHEMA = :db
+      AND TABLE_NAME REGEXP '^dispo_blocs_ac_[0-9]+(_[0-9]+)?$'
+    ORDER BY TABLE_NAME
+    """
+    df = execute_query(q, {"db": get_db_config()["database"]})
+    if df.empty:
+        return pd.DataFrame(columns=["site_code", "table_name"])
+
+    df.columns = [c.lower() for c in df.columns]
+    if "table_name" not in df.columns:
+        return pd.DataFrame(columns=["site_code", "table_name"])
+
+    def _parse(tbl: str) -> pd.Series:
+        t = str(tbl)
+        if t.startswith("dispo_blocs_ac_"):
+            return pd.Series([t[len("dispo_blocs_ac_"):], t])
+        return pd.Series([None, t])
+
+    out = df["table_name"].apply(_parse)
+    out.columns = ["site_code", "table_name"]
+    return out.dropna(subset=["site_code"]).reset_index(drop=True)
+
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def _list_pdc_tables() -> pd.DataFrame:
+    q = """
+    SELECT TABLE_NAME AS table_name
+    FROM information_schema.tables
+    WHERE TABLE_SCHEMA = :db
+      AND TABLE_NAME REGEXP '^dispo_pdc_n[0-9]+_[0-9]+(_[0-9]+)?$'
+    ORDER BY TABLE_NAME
+    """
+    df = execute_query(q, {"db": get_db_config()["database"]})
+    if df.empty:
+        return pd.DataFrame(columns=["site_code", "pdc_id", "table_name"])
+
+    df.columns = [c.lower() for c in df.columns]
+    if "table_name" not in df.columns:
+        return pd.DataFrame(columns=["site_code", "pdc_id", "table_name"])
+
+    def _parse(tbl: str) -> pd.Series:
+        t = str(tbl)
+        prefix = "dispo_pdc_"
+        if not t.startswith(prefix):
+            return pd.Series([None, None, t])
+        payload = t[len(prefix):]
+        parts = payload.split("_", 1)
+        if len(parts) != 2:
+            return pd.Series([None, None, t])
+        num = parts[0].lstrip("nN")
+        pdc_id = f"PDC{num}" if num else None
+        return pd.Series([parts[1], pdc_id, t])
+
+    out = df["table_name"].apply(_parse)
+    out.columns = ["site_code", "pdc_id", "table_name"]
+    return out.dropna(subset=["site_code", "pdc_id"]).reset_index(drop=True)
+
+def _sanitize_scope_options(options: List[str]) -> List[str]:
+    """Supprime les entrées génériques (tous/global) d'une liste."""
+    cleaned: List[str] = []
+    for value in options:
+        if value is None:
+            continue
+        text = str(value).strip()
+        if not text:
+            continue
+        lowered = text.lower()
+        if any(token in lowered for token in ("tous", "toutes", "all", "global", "ensemble")):
+            continue
+        cleaned.append(text)
+    return cleaned
+
+
+def get_sites(mode: str = MODE_EQUIPMENT) -> List[str]:
+    """Récupère la liste des sites en fonction du mode sélectionné."""
+    if mode == MODE_PDC:
+        try:
+            pdc = _list_pdc_tables()
+        except DatabaseError:
+            pdc = pd.DataFrame(columns=["site_code"])
+        if pdc.empty:
+            return []
+        return sorted(_sanitize_scope_options(pdc["site_code"].unique().tolist()))
+
+    try:
+        ac = _list_ac_tables()
+    except DatabaseError:
+        ac = pd.DataFrame(columns=["site_code"])
+    try:
+        bt = _list_batt_tables()
+    except DatabaseError:
+        bt = pd.DataFrame(columns=["site_code", "kind", "table_name"])
+
+    ac_sites = set(ac["site_code"].tolist()) if not ac.empty else set()
+    bt_sites = set(bt["site_code"].tolist()) if not bt.empty else set()
+    return sorted(_sanitize_scope_options(list(ac_sites.union(bt_sites))))
+
+
+def get_equipments(mode: str = MODE_EQUIPMENT, site: Optional[str] = None) -> List[str]:
+    if mode == MODE_PDC:
+        pdc_tbls = _list_pdc_tables()
+        if pdc_tbls.empty:
+            return []
+        if site:
+            subset = pdc_tbls[pdc_tbls["site_code"] == site]
+        else:
+            subset = pdc_tbls
+        return sorted(_sanitize_scope_options(subset["pdc_id"].unique().tolist()))
+
+    equips = set()
+    ac_tbls = _list_ac_tables()
+    bt_tbls = _list_batt_tables()
+
+    if site:
+        if not ac_tbls.empty and (ac_tbls["site_code"] == site).any():
+            equips.add("AC")
+        if not bt_tbls.empty and ((bt_tbls["site_code"] == site) & (bt_tbls["kind"] == "batt")).any():
+            equips.add("DC1")
+        if not bt_tbls.empty and ((bt_tbls["site_code"] == site) & (bt_tbls["kind"] == "batt2")).any():
+            equips.add("DC2")
+    else:
+        if not ac_tbls.empty:
+            equips.add("AC")
+        if not bt_tbls.empty and (bt_tbls["kind"] == "batt").any():
+            equips.add("DC1")
+        if not bt_tbls.empty and (bt_tbls["kind"] == "batt2").any():
+            equips.add("DC2")
+
+    return sorted(_sanitize_scope_options(list(equips)))
+
+
+def _load_blocks_equipment(site: str, equip: str, start_dt: datetime, end_dt: datetime) -> pd.DataFrame:
+    params = {"site": site, "equip": equip, "start": start_dt, "end": end_dt}
+    try:
+        q_view = """
+            SELECT *
+            FROM dispo_blocs_with_exclusion_flag
+            WHERE site = :site
+              AND equipement_id = :equip
+              AND date_debut < :end
+              AND date_fin   > :start
+            ORDER BY date_debut
+        """
         df = execute_query(q_view, params)
         if not df.empty and {"bloc_id", "source_table"}.issubset(df.columns):
             return _normalize_blocks_df(df)
-    except DatabaseError:#k
-        pass#k
-#k
-    batt_union = _batt_union_sql_for_site(site)#k
-    ac_union = _ac_union_sql_for_site(site)#k
-    q = f"""#k
-    WITH ac AS (#k
-        {ac_union}#k
-    ),#k
-    batt AS (#k
-        {batt_union}#k
-    ),#k
+    except DatabaseError:
+        pass
+
+    batt_union = _batt_union_sql_for_site(site)
+    ac_union = _ac_union_sql_for_site(site)
+    q = f"""
+    WITH ac AS (
+        {ac_union}
+    ),
+    batt AS (
+        {batt_union}
+    ),
     base AS (
         SELECT
         bloc_id, source_table,
@@ -1119,9 +1147,9 @@ def _ac_union_sql_for_site(site: str) -> str:
                    CAST(NULL AS CHAR) AS batch_id,
                    CAST(NULL AS CHAR) AS hash_signature
         ) x WHERE 1=0"""
-#k
-    m = df[df["site_code"] == site]#k
-    if m.empty:#k
+
+    m = df[df["site_code"] == site]
+    if m.empty:
         return """SELECT * FROM (
             SELECT CAST(NULL AS SIGNED) AS bloc_id,
                    CAST(NULL AS CHAR) AS source_table,
@@ -1137,10 +1165,10 @@ def _ac_union_sql_for_site(site: str) -> str:
                    CAST(NULL AS CHAR) AS batch_id,
                    CAST(NULL AS CHAR) AS hash_signature
         ) x WHERE 1=0"""
-#k
-    parts = []#k
-    for _, r in m.iterrows():#k
-        tbl = r["table_name"]#k
+
+    parts = []
+    for _, r in m.iterrows():
+        tbl = r["table_name"]
         parts.append(f"""
             SELECT
               id AS bloc_id,
@@ -1149,15 +1177,15 @@ def _ac_union_sql_for_site(site: str) -> str:
               est_disponible, cause, raw_point_count, processed_at, batch_id, hash_signature
             FROM `{tbl}`
         """)
-    return " UNION ALL ".join(parts)#k
-#k
-@st.cache_data(ttl=1800, show_spinner=False)#k
-def _ac_union_sql_all_sites() -> str:#k
-    """#k
-    UNION ALL de toutes les tables AC (colonnes explicites, sans duration_minutes).#k
-    """#k
-    df = _list_ac_tables()#k
-    if df.empty:#k
+    return " UNION ALL ".join(parts)
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def _ac_union_sql_all_sites() -> str:
+    """
+    UNION ALL de toutes les tables AC (colonnes explicites, sans duration_minutes).
+    """
+    df = _list_ac_tables()
+    if df.empty:
         return """SELECT * FROM (
             SELECT CAST(NULL AS SIGNED) AS bloc_id,
                    CAST(NULL AS CHAR) AS source_table,
@@ -1173,7 +1201,7 @@ def _ac_union_sql_all_sites() -> str:#k
                    CAST(NULL AS CHAR) AS batch_id,
                    CAST(NULL AS CHAR) AS hash_signature
         ) x WHERE 1=0"""
-    parts = [#k
+    parts = [
         f"""SELECT
               id AS bloc_id,
               '{tbl}' AS source_table,
@@ -1182,16 +1210,16 @@ def _ac_union_sql_all_sites() -> str:#k
             FROM `{tbl}`"""
         for tbl in df["table_name"].tolist()
     ]
-    return " UNION ALL ".join(parts)#k
-#k
-@st.cache_data(ttl=1800, show_spinner=False)#k
-def _batt_union_sql_for_site(site: str) -> str:#k
-    """#k
-    UNION ALL des tables BATT/BATT2 du site, en listant explicitement les colonnes#k
-    (pas de duration_minutes ici).#k
-    """#k
-    df = _list_batt_tables()#k
-    if df.empty:#k
+    return " UNION ALL ".join(parts)
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def _batt_union_sql_for_site(site: str) -> str:
+    """
+    UNION ALL des tables BATT/BATT2 du site, en listant explicitement les colonnes
+    (pas de duration_minutes ici).
+    """
+    df = _list_batt_tables()
+    if df.empty:
         return """SELECT * FROM (
             SELECT CAST(NULL AS SIGNED) AS bloc_id,
                    CAST(NULL AS CHAR) AS source_table,
@@ -1207,10 +1235,10 @@ def _batt_union_sql_for_site(site: str) -> str:#k
                    CAST(NULL AS CHAR) AS batch_id,
                    CAST(NULL AS CHAR) AS hash_signature
         ) x WHERE 1=0"""
-#k
-    parts = []#k
-    for _, r in df[df["site_code"] == site].iterrows():#k
-        tbl = r["table_name"]#k
+
+    parts = []
+    for _, r in df[df["site_code"] == site].iterrows():
+        tbl = r["table_name"]
         parts.append(f"""
             SELECT
               id AS bloc_id,
@@ -1219,7 +1247,7 @@ def _batt_union_sql_for_site(site: str) -> str:#k
               est_disponible, cause, raw_point_count, processed_at, batch_id, hash_signature
             FROM `{tbl}`
         """)
-    if not parts:#k
+    if not parts:
         return """SELECT * FROM (
             SELECT CAST(NULL AS SIGNED) AS bloc_id,
                    CAST(NULL AS CHAR) AS source_table,
@@ -1235,15 +1263,15 @@ def _batt_union_sql_for_site(site: str) -> str:#k
                    CAST(NULL AS CHAR) AS batch_id,
                    CAST(NULL AS CHAR) AS hash_signature
         ) x WHERE 1=0"""
-    return " UNION ALL ".join(parts)#k
-#k
-@st.cache_data(ttl=1800, show_spinner=False)#k
-def _batt_union_sql_all_sites() -> str:#k
-    """#k
-    UNION ALL de toutes les tables BATT/BATT2 (pas de duration_minutes ici).#k
-    """#k
-    df = _list_batt_tables()#k
-    if df.empty:#k
+    return " UNION ALL ".join(parts)
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def _batt_union_sql_all_sites() -> str:
+    """
+    UNION ALL de toutes les tables BATT/BATT2 (pas de duration_minutes ici).
+    """
+    df = _list_batt_tables()
+    if df.empty:
         return """SELECT * FROM (
             SELECT CAST(NULL AS SIGNED) AS bloc_id,
                    CAST(NULL AS CHAR) AS source_table,
@@ -1267,13 +1295,13 @@ def _batt_union_sql_all_sites() -> str:#k
           est_disponible, cause, raw_point_count, processed_at, batch_id, hash_signature
         FROM `{tbl}`
     """ for tbl in df["table_name"].tolist()]
-    return " UNION ALL ".join(parts)#k
-#k
-#k
-@st.cache_data(ttl=1800, show_spinner=False)#k
-def _pdc_union_sql_for_site(site: str) -> str:#k
-    df = _list_pdc_tables()#k
-    if df.empty:#k
+    return " UNION ALL ".join(parts)
+
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def _pdc_union_sql_for_site(site: str) -> str:
+    df = _list_pdc_tables()
+    if df.empty:
         return """SELECT * FROM (
             SELECT CAST(NULL AS SIGNED) AS bloc_id,
                    CAST(NULL AS CHAR) AS source_table,
@@ -1289,26 +1317,26 @@ def _pdc_union_sql_for_site(site: str) -> str:#k
                    CAST(NULL AS CHAR) AS batch_id,
                    CAST(NULL AS CHAR) AS hash_signature
         ) x WHERE 1=0"""
-#k
-    subset = df[df["site_code"] == site]#k
-    if subset.empty:#k
-        return """SELECT * FROM (#k
-            SELECT CAST(NULL AS CHAR) AS site,#k
-                   CAST(NULL AS CHAR) AS equipement_id,#k
-                   CAST(NULL AS CHAR) AS type_equipement,#k
-                   CAST(NULL AS DATETIME) AS date_debut,#k
-                   CAST(NULL AS DATETIME) AS date_fin,#k
-                   CAST(NULL AS SIGNED) AS est_disponible,#k
-                   CAST(NULL AS CHAR) AS cause,#k
-                   CAST(NULL AS SIGNED) AS raw_point_count,#k
-                   CAST(NULL AS DATETIME) AS processed_at,#k
-                   CAST(NULL AS CHAR) AS batch_id,#k
-                   CAST(NULL AS CHAR) AS hash_signature#k
-        ) x WHERE 1=0"""#k
-#k
-    parts = []#k
-    for _, row in subset.iterrows():#k
-        tbl = row["table_name"]#k
+
+    subset = df[df["site_code"] == site]
+    if subset.empty:
+        return """SELECT * FROM (
+            SELECT CAST(NULL AS CHAR) AS site,
+                   CAST(NULL AS CHAR) AS equipement_id,
+                   CAST(NULL AS CHAR) AS type_equipement,
+                   CAST(NULL AS DATETIME) AS date_debut,
+                   CAST(NULL AS DATETIME) AS date_fin,
+                   CAST(NULL AS SIGNED) AS est_disponible,
+                   CAST(NULL AS CHAR) AS cause,
+                   CAST(NULL AS SIGNED) AS raw_point_count,
+                   CAST(NULL AS DATETIME) AS processed_at,
+                   CAST(NULL AS CHAR) AS batch_id,
+                   CAST(NULL AS CHAR) AS hash_signature
+        ) x WHERE 1=0"""
+
+    parts = []
+    for _, row in subset.iterrows():
+        tbl = row["table_name"]
         parts.append(f"""
             SELECT
               id AS bloc_id,
@@ -1318,7 +1346,7 @@ def _pdc_union_sql_for_site(site: str) -> str:#k
               type_label AS type_equipement,
               date_debut,
               date_fin,
-              etat AS est_disponible,
+              est_disponible,
               cause,
               raw_point_count,
               processed_at,
@@ -1326,25 +1354,25 @@ def _pdc_union_sql_for_site(site: str) -> str:#k
               hash_signature
             FROM `{tbl}`
         """)
-    return " UNION ALL ".join(parts)#k
-@st.cache_data(ttl=1800, show_spinner=False)#k
-def _pdc_union_sql_all_sites() -> str:#k
-    df = _list_pdc_tables()#k
-    if df.empty:#k
-        return """SELECT * FROM (#k
-            SELECT CAST(NULL AS CHAR) AS site,#k
-                   CAST(NULL AS CHAR) AS equipement_id,#k
-                   CAST(NULL AS CHAR) AS type_equipement,#k
-                   CAST(NULL AS DATETIME) AS date_debut,#k
-                   CAST(NULL AS DATETIME) AS date_fin,#k
-                   CAST(NULL AS SIGNED) AS est_disponible,#k
-                   CAST(NULL AS CHAR) AS cause,#k
-                   CAST(NULL AS SIGNED) AS raw_point_count,#k
-                   CAST(NULL AS DATETIME) AS processed_at,#k
-                   CAST(NULL AS CHAR) AS batch_id,#k
-                   CAST(NULL AS CHAR) AS hash_signature#k
-        ) x WHERE 1=0"""#k
-#k
+    return " UNION ALL ".join(parts)
+@st.cache_data(ttl=1800, show_spinner=False)
+def _pdc_union_sql_all_sites() -> str:
+    df = _list_pdc_tables()
+    if df.empty:
+        return """SELECT * FROM (
+            SELECT CAST(NULL AS CHAR) AS site,
+                   CAST(NULL AS CHAR) AS equipement_id,
+                   CAST(NULL AS CHAR) AS type_equipement,
+                   CAST(NULL AS DATETIME) AS date_debut,
+                   CAST(NULL AS DATETIME) AS date_fin,
+                   CAST(NULL AS SIGNED) AS est_disponible,
+                   CAST(NULL AS CHAR) AS cause,
+                   CAST(NULL AS SIGNED) AS raw_point_count,
+                   CAST(NULL AS DATETIME) AS processed_at,
+                   CAST(NULL AS CHAR) AS batch_id,
+                   CAST(NULL AS CHAR) AS hash_signature
+        ) x WHERE 1=0"""
+
     parts = [
         f"""
             SELECT
@@ -1355,7 +1383,7 @@ def _pdc_union_sql_all_sites() -> str:#k
               type_label AS type_equipement,
               date_debut,
               date_fin,
-              etat AS est_disponible,
+              est_disponible,
               cause,
               raw_point_count,
               processed_at,
@@ -3430,11 +3458,9 @@ def render_timeline_tab(site: Optional[str], equip: Optional[str], start_dt: dat
                                 )
                                 st.balloons()
                                 st.rerun()
-        with st.form("annotation_form", clear_on_submit=True):
+
             st.markdown(f"**Bloc sélectionné:** {selected_row['start']} → {selected_row['end']}")
-            
-            # Ajouter la traduction automatique de la cause du bloc sélectionné
-            if est_val != 1:  # Si le bloc n'est pas disponible
+            if est_val != 1: 
                 cause_originale = selected_row.get("cause", "Non spécifié")
                 equip_current = st.session_state.get("current_equip")
                 
@@ -3450,65 +3476,7 @@ def render_timeline_tab(site: Optional[str], equip: Optional[str], start_dt: dat
                 else:
                     st.markdown("**🔧 Cause d'indisponibilité :**")
                     st.info(f"**Cause :** {cause_originale}")
-            
-            if est_val == 1:
-                ann_options = ["Commentaire"]
-                ann_help = "Impossible d'exclure un bloc déjà disponible"
-                ann_index = 0
-            else:
-                ann_options = ["Exclusion", "Commentaire"]
-                ann_help = "Commentaire: note informative | Exclusion: exclure du calcul de disponibilité"
-                ann_index = 0  
-
-            col1, col2 = st.columns(2)
-            with col1:
-                annotation_type = st.radio(
-                    "Type d'annotation",
-                    options=ann_options,
-                    index=ann_index,
-                    horizontal=True,
-                    help=ann_help
-                )
-
-            with col2:
-                user_name = st.text_input(
-                    "Votre nom (optionnel)",
-                    placeholder="ex: Jean Dupont",
-                    help="Identifiez-vous pour traçabilité"
-                )
-
-            default_comment = ""
-            if annotation_type == "Exclusion" and est_val == -1:
-                default_comment = f"Exclusion: données manquantes ({selected_row['start']} → {selected_row['end']})"
-
-            comment = st.text_area(
-                "Commentaire / Raison",
-                value=default_comment, 
-                placeholder="Décrivez la raison de cette annotation...",
-                help="Obligatoire - Minimum 10 caractères"
-            )
-
-            submitted = st.form_submit_button("✅ Valider l'annotation")
-
-            if submitted:
-                if not comment :
-                    st.error("❌ Veuillez mettre un commentaire.")
-                else:
-                    type_db = "commentaire" if annotation_type == "Commentaire" else "exclusion"
-                    user = user_name.strip() or "Utilisateur UI"
-                    success = create_annotation(
-                        site=site,
-                        equip=equip,
-                        start_dt=selected_row["date_debut"],
-                        end_dt=selected_row["date_fin"],
-                        annotation_type=type_db,
-                        comment=comment.strip(),
-                        user=user
-                    )
-                    if success:
-                        st.success(f"✅ {annotation_type} ajoutée avec succès !")
-                        st.balloons()
-                        st.rerun()
+                    st.rerun()
 
     with st.expander("⚡ Exclusion rapide des données manquantes", expanded=False):
         month_default = datetime.utcnow().date().replace(day=1)
