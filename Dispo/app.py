@@ -1595,25 +1595,30 @@ def _aggregate_monthly_availability(
             rows.append({"month": month, "pct_brut": 0.0, "pct_excl": 0.0, "total_minutes": 0})
             continue
 
-        # CORRECTION: Inverser la logique
+        durations = group["duration_minutes_window"]
         current_status = group["est_disponible"]
-        
-        # Disponibilité BRUTE = statut AVANT exclusions (previous_status pour les exclus)
+
         if "is_excluded" in group.columns and "previous_status" in group.columns:
             brut_status = current_status.where(group["is_excluded"] == 0, group["previous_status"])
         else:
             brut_status = current_status
-        
-        avail_brut = int(group.loc[brut_status == 1, "duration_minutes_window"].sum())
-        
-        # Disponibilité AVEC EXCLUSIONS = statut ACTUEL (est_disponible)
-        avail_excl = int(group.loc[current_status == 1, "duration_minutes_window"].sum())
+
+        def _availability_percentage(status_series: pd.Series) -> float:
+            available = int(durations.loc[status_series == 1].sum())
+            unavailable = int(durations.loc[status_series == 0].sum())
+            effective_total = available + unavailable
+            if effective_total <= 0:
+                return 0.0
+            return available / effective_total * 100.0
+
+        pct_brut = _availability_percentage(brut_status)
+        pct_excl = _availability_percentage(current_status)
 
         rows.append(
             {
                 "month": month,
-                "pct_brut": avail_brut / total * 100.0,
-                "pct_excl": avail_excl / total * 100.0,
+                "pct_brut": pct_brut,
+                "pct_excl": pct_excl,
                 "total_minutes": total,
             }
         )
