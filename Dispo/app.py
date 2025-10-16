@@ -3592,24 +3592,161 @@ def render_timeline_tab(site: Optional[str], equip: Optional[str], start_dt: dat
                                 st.balloons()
                                 st.rerun()
 
-            st.markdown(f"**Bloc sélectionné:** {selected_row['start']} → {selected_row['end']}")
-            if est_val != 1: 
-                cause_originale = selected_row.get("cause", "Non spécifié")
-                equip_current = st.session_state.get("current_equip")
-                
-                if equip_current and cause_originale != "Non spécifié":
-                    cause_traduite = translate_cause_to_text(cause_originale, equip_current)
-                    
-                    if cause_traduite != cause_originale:
-                        st.markdown("**🔧 Cause d'indisponibilité traduite :**")
-                        st.info(f"**Original :** {cause_originale}\n\n**Traduit :** {cause_traduite}")
-                    else:
-                        st.markdown("**🔧 Cause d'indisponibilité :**")
-                        st.info(f"**Cause :** {cause_originale}")
+        st.markdown(f"**Bloc sélectionné:** {selected_row['start']} → {selected_row['end']}")
+
+        block_start_value = selected_row.get("start")
+        block_end_value = selected_row.get("end")
+
+        def _to_naive_datetime(value: Any) -> Optional[datetime]:
+            if value is None:
+                return None
+            if isinstance(value, pd.Timestamp):
+                dt_value = value.to_pydatetime()
+            elif isinstance(value, datetime):
+                dt_value = value
+            else:
+                try:
+                    dt_value = pd.to_datetime(value).to_pydatetime()
+                except Exception:
+                    return None
+            if dt_value.tzinfo is not None:
+                return dt_value.replace(tzinfo=None)
+            return dt_value
+
+        block_start_dt = _to_naive_datetime(block_start_value)
+        block_end_dt = _to_naive_datetime(block_end_value)
+
+        st.markdown("### 💬 Commentaires sur ce bloc")
+        st.caption("Ajoutez une annotation informative ou consultez les commentaires existants sur cette période.")
+
+        existing_comments = get_annotations(annotation_type="commentaire", limit=200)
+        if not existing_comments.empty and block_start_dt and block_end_dt:
+            comments_df = existing_comments.copy()
+            comments_df["date_debut"] = pd.to_datetime(comments_df["date_debut"], errors="coerce")
+            comments_df["date_fin"] = pd.to_datetime(comments_df["date_fin"], errors="coerce")
+
+            equip_label = str(selected_row.get("equipement_id", "")).upper()
+            site_label = str(selected_row.get("site", ""))
+
+            mask_same_scope = (
+                comments_df["equipement_id"].astype(str).str.upper() == equip_label
+            ) & (comments_df["site"].astype(str) == site_label)
+
+            mask_overlap = (
+                comments_df["date_fin"] > block_start_dt
+            ) & (comments_df["date_debut"] < block_end_dt)
+
+            scoped_comments = comments_df[mask_same_scope & mask_overlap].copy()
+
+            if scoped_comments.empty:
+                st.info("ℹ️ Aucun commentaire enregistré pour ce bloc pour le moment.")
+            else:
+                scoped_comments["Période"] = scoped_comments.apply(
+                    lambda r: f"{pd.to_datetime(r['date_debut']).strftime('%Y-%m-%d %H:%M')} → {pd.to_datetime(r['date_fin']).strftime('%Y-%m-%d %H:%M')}",
+                    axis=1,
+                )
+                scoped_comments["Créé le"] = pd.to_datetime(scoped_comments["created_at"]).dt.strftime("%Y-%m-%d %H:%M")
+                scoped_comments["Statut"] = scoped_comments["actif"].map({1: "✅ Actif", 0: "❌ Inactif"})
+
+                display_cols = [
+                    "id",
+                    "Période",
+                    "commentaire",
+                    "Statut",
+                    "created_by",
+                    "Créé le",
+                ]
+
+                st.dataframe(
+                    scoped_comments[display_cols],
+                    hide_index=True,
+                    use_container_width=True,
+                    column_config={
+                        "id": st.column_config.NumberColumn("ID", width="small"),
+                        "Période": st.column_config.TextColumn("Période", width="medium"),
+                        "commentaire": st.column_config.TextColumn("Commentaire", width="large"),
+                        "Statut": st.column_config.TextColumn("Statut", width="small"),
+                        "created_by": st.column_config.TextColumn("Créé par", width="medium"),
+                        "Créé le": st.column_config.TextColumn("Créé le", width="medium"),
+                    },
+                )
+        else:
+            st.info("ℹ️ Aucun commentaire enregistré pour ce bloc pour le moment.")
+
+        default_comment_start = block_start_dt or datetime.now().replace(second=0, microsecond=0)
+        default_comment_end = block_end_dt or (default_comment_start + timedelta(minutes=5))
+
+        with st.form(f"add_comment_form_{bloc_id}"):
+            comment_text = st.text_area(
+                "Commentaire",
+                placeholder="Décrivez l'information à retenir pour cette période...",
+                help="Les commentaires sont informatifs et n'impactent pas les calculs de disponibilité.",
+            )
+            comment_author = st.text_input(
+                "Créé par",
+                placeholder="Votre nom",
+                help="Ce champ est facultatif mais recommandé pour tracer l'origine du commentaire.",
+            )
+
+            col_comment_dates = st.columns(2)
+            with col_comment_dates[0]:
+                comment_start = st.datetime_input(
+                    "Début du commentaire",
+                    value=default_comment_start,
+                    help="Date et heure de début de la période couverte par le commentaire.",
+                )
+            with col_comment_dates[1]:
+                comment_end = st.datetime_input(
+                    "Fin du commentaire",
+                    value=default_comment_end,
+                    help="Date et heure de fin de la période couverte par le commentaire.",
+                )
+
+            submit_comment = st.form_submit_button("💾 Enregistrer le commentaire", type="primary")
+
+        if submit_comment:
+            comment_txt = (comment_text or "").strip()
+            if len(comment_txt) < 5:
+                st.error("❌ Le commentaire doit contenir au moins 5 caractères.")
+            elif comment_start is None or comment_end is None:
+                st.error("❌ Merci de renseigner une période valide pour le commentaire.")
+            elif comment_start >= comment_end:
+                st.error("❌ La date de fin doit être postérieure à la date de début.")
+            else:
+                author_txt = (comment_author or "").strip()
+                success = create_annotation(
+                    site=str(selected_row.get("site", "")),
+                    equip=str(selected_row.get("equipement_id", "")),
+                    start_dt=comment_start,
+                    end_dt=comment_end,
+                    annotation_type="commentaire",
+                    comment=comment_txt,
+                    user=author_txt or "ui",
+                )
+                if success:
+                    st.success("✅ Commentaire enregistré avec succès !")
+                    st.balloons()
+                    st.rerun()
+                else:
+                    st.error("❌ Impossible d'enregistrer le commentaire. Veuillez réessayer.")
+
+        if est_val != 1:
+            cause_originale = selected_row.get("cause", "Non spécifié")
+            equip_current = st.session_state.get("current_equip")
+
+            if equip_current and cause_originale != "Non spécifié":
+                cause_traduite = translate_cause_to_text(cause_originale, equip_current)
+
+                if cause_traduite != cause_originale:
+                    st.markdown("**🔧 Cause d'indisponibilité traduite :**")
+                    st.info(f"**Original :** {cause_originale}\n\n**Traduit :** {cause_traduite}")
                 else:
                     st.markdown("**🔧 Cause d'indisponibilité :**")
                     st.info(f"**Cause :** {cause_originale}")
-                    st.rerun()
+            else:
+                st.markdown("**🔧 Cause d'indisponibilité :**")
+                st.info(f"**Cause :** {cause_originale}")
+                st.rerun()
 
     with st.expander("⚡ Exclusion rapide des données manquantes", expanded=False):
         month_default = datetime.date().replace(day=1)
