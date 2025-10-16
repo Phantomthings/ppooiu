@@ -3821,49 +3821,136 @@ def render_exclusions_tab():
     if df_active.empty:
         st.success("✅ Aucune exclusion active dans la base de données.")
     else:
-        for _, row in df_active.iterrows():
-            block_label = f"Bloc #{int(row['bloc_id'])} · {row['table_name']}"
-            status_label = {1: "Disponible", 0: "Indisponible", -1: "Donnée manquante"}.get(int(row.get("previous_status", -1)), "Inconnu")
-            with st.expander(block_label, expanded=False):
-                st.write(
-                    {
-                        "Statut initial": status_label,
-                        "Commentaire": row.get("exclusion_comment") or "—",
-                        "Appliquée par": row.get("applied_by") or "—",
-                        "Appliquée le": pd.to_datetime(row.get("applied_at")).strftime("%Y-%m-%d %H:%M") if row.get("applied_at") else "—",
-                    }
-                )
+        status_map = {1: "Disponible", 0: "Indisponible", -1: "Donnée manquante"}
 
-                form_key = f"release_form_{row['id']}"
-                with st.form(form_key):
-                    release_operator = st.text_input(
-                        "Opérateur (historisation)",
-                        placeholder="ex: Jean Dupont",
-                        key=f"release_operator_{row['id']}",
+        def _format_applied_at(value: Any) -> str:
+            timestamp = pd.to_datetime(value, errors="coerce")
+            if pd.isna(timestamp):
+                return "—"
+            return timestamp.strftime("%Y-%m-%d %H:%M")
+
+        def _format_duration(delta: Optional[pd.Timedelta]) -> str:
+            if delta is None or pd.isna(delta):
+                return "—"
+            total_minutes = max(int(delta.total_seconds() // 60), 0)
+            days, remainder = divmod(total_minutes, 1440)
+            hours, minutes = divmod(remainder, 60)
+            parts: List[str] = []
+            if days:
+                parts.append(f"{days} j")
+            if hours:
+                parts.append(f"{hours} h")
+            if minutes or not parts:
+                parts.append(f"{minutes} min")
+            return " ".join(parts)
+
+        now_ts = pd.Timestamp.utcnow()
+        applied_ts = pd.to_datetime(df_active["applied_at"], errors="coerce")
+
+        df_active_display = pd.DataFrame(
+            {
+                "Sélection": [False] * len(df_active),
+                "ID exclusion": df_active["id"].astype(int),
+                "Table": df_active["table_name"],
+                "Bloc": df_active["bloc_id"].astype(int),
+                "Statut initial": df_active["previous_status"].map(status_map).fillna("Inconnu"),
+                "Commentaire": df_active["exclusion_comment"].fillna("—"),
+                "Appliquée par": df_active["applied_by"].fillna("—"),
+                "Appliquée le": applied_ts.map(_format_applied_at),
+                "Actif depuis": (now_ts - applied_ts).map(_format_duration),
+            }
+        )
+
+        st.caption("Sélectionnez une ou plusieurs exclusions pour afficher les détails et les lever en lot.")
+        edited_active = st.data_editor(
+            df_active_display,
+            hide_index=True,
+            num_rows="fixed",
+            column_config={
+                "Sélection": st.column_config.CheckboxColumn(
+                    "Sélection",
+                    help="Cochez pour inclure l'exclusion dans la sélection courante.",
+                    default=False,
+                ),
+                "Commentaire": st.column_config.TextColumn(disabled=True),
+                "Appliquée par": st.column_config.TextColumn(disabled=True),
+                "Appliquée le": st.column_config.TextColumn(disabled=True),
+                "Actif depuis": st.column_config.TextColumn(disabled=True),
+            },
+            disabled=["ID exclusion", "Table", "Bloc", "Statut initial"],
+            key="active_exclusions_editor",
+        )
+
+        selected_ids = [
+            int(row["ID exclusion"])
+            for _, row in edited_active.iterrows()
+            if bool(row.get("Sélection"))
+        ]
+
+        if selected_ids:
+            st.info(
+                f"{len(selected_ids)} exclusion{'s' if len(selected_ids) > 1 else ''} sélectionnée{'s' if len(selected_ids) > 1 else ''}."
+            )
+
+            selected_details = df_active[df_active["id"].isin(selected_ids)]
+            with st.expander("Détails des exclusions sélectionnées", expanded=False):
+                for _, selected in selected_details.sort_values("applied_at", ascending=False).iterrows():
+                    st.markdown(
+                        f"**Bloc #{int(selected['bloc_id'])} · {selected['table_name']}**"
                     )
-                    release_comment = st.text_area(
-                        "Commentaire de réactivation",
-                        placeholder="Expliquez pourquoi l'exclusion est levée",
-                        key=f"release_comment_{row['id']}",
+                    st.write(
+                        {
+                            "ID": int(selected["id"]),
+                            "Statut initial": status_map.get(int(selected.get("previous_status", -1)), "Inconnu"),
+                            "Commentaire": selected.get("exclusion_comment") or "—",
+                            "Appliquée par": selected.get("applied_by") or "—",
+                            "Appliquée le": _format_applied_at(selected.get("applied_at")),
+                        }
                     )
-                    submit_release = st.form_submit_button("♻️ Lever l'exclusion")
-                    if submit_release:
-                        comment_txt = release_comment.strip()
-                        if len(comment_txt) < 5:
-                            st.error("❌ Le commentaire doit contenir au moins 5 caractères.")
-                        else:
-                            try:
-                                release_block_exclusion(
-                                    table_name=str(row["table_name"]),
-                                    block_id=int(row["bloc_id"]),
-                                    user=release_operator.strip() or None,
-                                    comment=comment_txt,
-                                )
-                            except ExclusionError as exc:
-                                st.error(f"❌ Impossible de lever l'exclusion : {exc}")
-                            else:
-                                st.success(f"✅ Exclusion #{int(row['id'])} levée.")
-                                st.rerun()
+
+        with st.form("bulk_release_form"):
+            release_operator = st.text_input(
+                "Opérateur (historisation)",
+                placeholder="ex: Jean Dupont",
+            )
+            release_comment = st.text_area(
+                "Commentaire de réactivation",
+                placeholder="Expliquez pourquoi les exclusions sélectionnées sont levées",
+            )
+            submit_bulk_release = st.form_submit_button("♻️ Lever les exclusions sélectionnées", disabled=not selected_ids)
+
+        if submit_bulk_release:
+            comment_txt = release_comment.strip()
+            if not selected_ids:
+                st.warning("Veuillez sélectionner au moins une exclusion active à lever.")
+            elif len(comment_txt) < 5:
+                st.error("❌ Le commentaire doit contenir au moins 5 caractères.")
+            else:
+                successes = 0
+                errors: List[str] = []
+                for exclusion_id in selected_ids:
+                    row = df_active[df_active["id"] == exclusion_id].iloc[0]
+                    try:
+                        release_block_exclusion(
+                            table_name=str(row["table_name"]),
+                            block_id=int(row["bloc_id"]),
+                            user=release_operator.strip() or None,
+                            comment=comment_txt,
+                        )
+                    except ExclusionError as exc:
+                        errors.append(f"Exclusion #{exclusion_id}: {exc}")
+                    else:
+                        successes += 1
+
+                if successes:
+                    st.success(
+                        f"✅ {successes} exclusion{'s' if successes > 1 else ''} levée{'s' if successes > 1 else ''} avec succès."
+                    )
+                if errors:
+                    st.error("\n".join(f"❌ {message}" for message in errors))
+
+                if successes:
+                    st.rerun()
     st.subheader("🕒 Historique récent")
     df_history = get_block_exclusions(active_only=False, limit=200)
     if df_history.empty:
