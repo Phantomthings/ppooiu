@@ -53,11 +53,14 @@ PdcTimelineLoader = Callable[[str, datetime, datetime], List[AvailabilityTimelin
 ExclusionLoader = Callable[[str, datetime, datetime], IntervalCollection]
 
 
-def localize_to_paris(dt: datetime) -> pd.Timestamp:
+APP_TIMEZONE = "Europe/Zurich"
+
+
+def localize_to_app_timezone(dt: datetime) -> pd.Timestamp:
     ts = pd.Timestamp(dt)
     if ts.tzinfo is None:
-        return ts.tz_localize("Europe/Paris", nonexistent="shift_forward", ambiguous="NaT")
-    return ts.tz_convert("Europe/Paris")
+        return ts.tz_localize(APP_TIMEZONE, nonexistent="shift_forward", ambiguous="NaT")
+    return ts.tz_convert(APP_TIMEZONE)
 
 
 def build_timeline(
@@ -75,13 +78,13 @@ def build_timeline(
         if pd.isna(start_ts) or pd.isna(end_ts):
             continue
         if start_ts.tzinfo is None:
-            start_ts = start_ts.tz_localize("Europe/Paris", nonexistent="shift_forward", ambiguous="NaT")
+            start_ts = start_ts.tz_localize(APP_TIMEZONE, nonexistent="shift_forward", ambiguous="NaT")
         else:
-            start_ts = start_ts.tz_convert("Europe/Paris")
+            start_ts = start_ts.tz_convert(APP_TIMEZONE)
         if end_ts.tzinfo is None:
-            end_ts = end_ts.tz_localize("Europe/Paris", nonexistent="shift_forward", ambiguous="NaT")
+            end_ts = end_ts.tz_localize(APP_TIMEZONE, nonexistent="shift_forward", ambiguous="NaT")
         else:
-            end_ts = end_ts.tz_convert("Europe/Paris")
+            end_ts = end_ts.tz_convert(APP_TIMEZONE)
         start_clipped = max(start_ts, start)
         end_clipped = min(end_ts, end)
         if pd.isna(start_clipped) or pd.isna(end_clipped) or start_clipped >= end_clipped:
@@ -115,8 +118,8 @@ class ContractCalculator:
         start_dt: datetime,
         end_dt: datetime,
     ) -> Tuple[pd.DataFrame, List[str]]:
-        start = localize_to_paris(start_dt)
-        end = localize_to_paris(end_dt)
+        start = localize_to_app_timezone(start_dt)
+        end = localize_to_app_timezone(end_dt)
 
         if pd.isna(start) or pd.isna(end) or end <= start:
             return pd.DataFrame(), ["Plage temporelle invalide"]

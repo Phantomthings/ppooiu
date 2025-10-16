@@ -17,8 +17,10 @@ from contract_calculator import (
     ContractCalculator,
     IntervalCollection,
     build_timeline,
-    localize_to_paris,
+    localize_to_app_timezone,
 )
+
+APP_TIMEZONE = "Europe/Zurich"
 
 logger = logging.getLogger("contract_job")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -73,13 +75,10 @@ def _normalize_blocks_df(df: pd.DataFrame) -> pd.DataFrame:
     for col in ["date_debut", "date_fin", "processed_at"]:
         if col in out.columns:
             series = pd.to_datetime(out[col], errors="coerce")
-            try:
-                if series.dt.tz is None:
-                    series = series.dt.tz_localize("Europe/Paris", nonexistent="shift_forward", ambiguous="NaT")
-                else:
-                    series = series.dt.tz_convert("Europe/Paris")
-            except Exception:
-                pass
+            if getattr(series.dt, "tz", None) is None:
+                series = series.dt.tz_localize(APP_TIMEZONE, nonexistent="shift_forward", ambiguous="NaT")
+            else:
+                series = series.dt.tz_convert(APP_TIMEZONE)
             out[col] = series
     for col in ["est_disponible", "raw_point_count", "duration_minutes", "is_excluded"]:
         if col in out.columns:
@@ -185,7 +184,7 @@ def _query_union_bounds(engine: Engine, union_sql: str, site: str) -> Tuple[Opti
         if pd.isna(ts):
             return None
         if ts.tzinfo is not None:
-            ts = ts.tz_convert("Europe/Paris").tz_localize(None)
+            ts = ts.tz_convert(APP_TIMEZONE).tz_localize(None)
         return ts.to_pydatetime()
 
     return _convert(df.loc[0, "min_start"]), _convert(df.loc[0, "max_end"])
@@ -411,13 +410,13 @@ def _load_exclusion_intervals(
         if pd.isna(start_ts) or pd.isna(end_ts):
             continue
         if start_ts.tzinfo is None:
-            start_ts = start_ts.tz_localize("Europe/Paris", nonexistent="shift_forward", ambiguous="NaT")
+            start_ts = start_ts.tz_localize(APP_TIMEZONE, nonexistent="shift_forward", ambiguous="NaT")
         else:
-            start_ts = start_ts.tz_convert("Europe/Paris")
+            start_ts = start_ts.tz_convert(APP_TIMEZONE)
         if end_ts.tzinfo is None:
-            end_ts = end_ts.tz_localize("Europe/Paris", nonexistent="shift_forward", ambiguous="NaT")
+            end_ts = end_ts.tz_localize(APP_TIMEZONE, nonexistent="shift_forward", ambiguous="NaT")
         else:
-            end_ts = end_ts.tz_convert("Europe/Paris")
+            end_ts = end_ts.tz_convert(APP_TIMEZONE)
         if pd.isna(start_ts) or pd.isna(end_ts) or start_ts >= end_ts:
             continue
         intervals.append((start_ts, end_ts))
@@ -432,8 +431,8 @@ def _build_equipment_timelines(
     start_dt: datetime,
     end_dt: datetime,
 ) -> Dict[str, AvailabilityTimeline]:
-    start = localize_to_paris(start_dt)
-    end = localize_to_paris(end_dt)
+    start = localize_to_app_timezone(start_dt)
+    end = localize_to_app_timezone(end_dt)
     timelines: Dict[str, AvailabilityTimeline] = {}
     for equip in ["AC", "DC1", "DC2"]:
         try:
@@ -451,8 +450,8 @@ def _build_pdc_timelines(
     start_dt: datetime,
     end_dt: datetime,
 ) -> List[AvailabilityTimeline]:
-    start = localize_to_paris(start_dt)
-    end = localize_to_paris(end_dt)
+    start = localize_to_app_timezone(start_dt)
+    end = localize_to_app_timezone(end_dt)
     timelines: List[AvailabilityTimeline] = []
     for pdc_id in _load_site_pdc_ids(engine, site):
         try:
