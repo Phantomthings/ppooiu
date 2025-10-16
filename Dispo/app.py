@@ -12,7 +12,7 @@ import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
-from sqlalchemy import create_engine, text, inspect
+from sqlalchemy import create_engine, text, inspect, bindparam
 from sqlalchemy.exc import NoSuchTableError, SQLAlchemyError
 
 
@@ -259,7 +259,31 @@ def _fetch_block_status(conn, table_name: str, block_id: int) -> int:
 
 
 _STATUS_COLUMN_CACHE: Dict[str, str] = {}
+_TABLE_COLUMNS_CACHE: Dict[str, Set[str]] = {}
 _STATUS_COLUMN_CANDIDATES: Tuple[str, ...] = ("est_disponible", "etat")
+_TIME_COLUMNS_CACHE: Dict[str, Tuple[Optional[str], Optional[str]]] = {}
+_TIME_START_CANDIDATES: Tuple[str, ...] = ("date_debut", "start_time", "start", "debut")
+_TIME_END_CANDIDATES: Tuple[str, ...] = ("date_fin", "end_time", "finish", "fin")
+
+
+def _get_table_columns(conn, table_name: str) -> Set[str]:
+    if table_name in _TABLE_COLUMNS_CACHE:
+        return _TABLE_COLUMNS_CACHE[table_name]
+
+    inspector = inspect(conn)
+    try:
+        columns = {col["name"] for col in inspector.get_columns(table_name)}
+    except NoSuchTableError as exc:
+        raise ExclusionError(
+            f"Table {table_name} introuvable lors de la résolution des colonnes."
+        ) from exc
+    except SQLAlchemyError as exc:  # pragma: no cover - safety net
+        raise ExclusionError(
+            f"Impossible de récupérer les colonnes pour {table_name}: {exc}"
+        ) from exc
+
+    _TABLE_COLUMNS_CACHE[table_name] = columns
+    return columns
 
 
 def _resolve_status_column(conn, table_name: str) -> str:
@@ -268,17 +292,7 @@ def _resolve_status_column(conn, table_name: str) -> str:
     if table_name in _STATUS_COLUMN_CACHE:
         return _STATUS_COLUMN_CACHE[table_name]
 
-    inspector = inspect(conn)
-    try:
-        columns = {col["name"] for col in inspector.get_columns(table_name)}
-    except NoSuchTableError as exc:
-        raise ExclusionError(
-            f"Table {table_name} introuvable lors de la résolution de la colonne de statut."
-        ) from exc
-    except SQLAlchemyError as exc:  # pragma: no cover - safety net
-        raise ExclusionError(
-            f"Impossible de déterminer la colonne de statut pour {table_name}: {exc}"
-        ) from exc
+    columns = _get_table_columns(conn, table_name)
 
     for candidate in _STATUS_COLUMN_CANDIDATES:
         if candidate in columns:
@@ -288,6 +302,18 @@ def _resolve_status_column(conn, table_name: str) -> str:
     raise ExclusionError(
         f"La table {table_name} ne contient aucune colonne de statut reconnue ({', '.join(_STATUS_COLUMN_CANDIDATES)})."
     )
+
+
+def _resolve_time_columns(conn, table_name: str) -> Tuple[Optional[str], Optional[str]]:
+    if table_name in _TIME_COLUMNS_CACHE:
+        return _TIME_COLUMNS_CACHE[table_name]
+
+    columns = _get_table_columns(conn, table_name)
+    start_col = next((col for col in _TIME_START_CANDIDATES if col in columns), None)
+    end_col = next((col for col in _TIME_END_CANDIDATES if col in columns), None)
+
+    _TIME_COLUMNS_CACHE[table_name] = (start_col, end_col)
+    return _TIME_COLUMNS_CACHE[table_name]
 
 def _is_valid_table_name(table_name: str) -> bool:
     return bool(_TABLE_NAME_PATTERN.match(table_name))
@@ -1678,6 +1704,79 @@ def get_block_exclusions(active_only: bool = True, limit: int = 200) -> pd.DataF
     except DatabaseError as exc:
         st.error(f"Erreur lors du chargement des exclusions: {exc}")
         return pd.DataFrame()
+
+
+def _fetch_blocks_metadata(df_pairs: pd.DataFrame) -> Dict[Tuple[str, int], Dict[str, Any]]:
+    metadata: Dict[Tuple[str, int], Dict[str, Any]] = {}
+    if df_pairs is None or df_pairs.empty:
+        return metadata
+
+    engine = get_engine()
+    try:
+        with engine.begin() as conn:
+            for table_name, group in df_pairs.groupby("table_name"):
+                if not _is_valid_table_name(table_name):
+                    logger.warning(
+                        "Nom de table ignoré lors de la récupération des métadonnées: %s",
+                        table_name,
+                    )
+                    continue
+
+                ids = (
+                    pd.to_numeric(group["bloc_id"], errors="coerce")
+                    .dropna()
+                    .astype(int)
+                    .unique()
+                )
+                if not len(ids):
+                    continue
+
+                try:
+                    status_col = _resolve_status_column(conn, table_name)
+                except ExclusionError:
+                    status_col = None
+
+                start_col, end_col = _resolve_time_columns(conn, table_name)
+
+                select_cols = ["id"]
+                if status_col:
+                    select_cols.append(status_col)
+                if start_col and start_col not in select_cols:
+                    select_cols.append(start_col)
+                if end_col and end_col not in select_cols:
+                    select_cols.append(end_col)
+
+                stmt = (
+                    text(
+                        f"SELECT {', '.join(select_cols)} FROM `{table_name}` WHERE id IN :ids"
+                    ).bindparams(bindparam("ids", expanding=True))
+                )
+
+                try:
+                    rows = conn.execute(stmt, {"ids": ids}).mappings()
+                except SQLAlchemyError as exc:
+                    logger.error(
+                        "Erreur lors de la récupération des blocs pour %s: %s",
+                        table_name,
+                        exc,
+                    )
+                    continue
+
+                for row in rows:
+                    block_id = row.get("id")
+                    if block_id is None:
+                        continue
+
+                    key = (table_name, int(block_id))
+                    metadata[key] = {
+                        "status": row.get(status_col) if status_col else None,
+                        "date_debut": row.get(start_col) if start_col else None,
+                        "date_fin": row.get(end_col) if end_col else None,
+                    }
+    except SQLAlchemyError as exc:
+        logger.error("Impossible de récupérer les métadonnées des blocs: %s", exc)
+
+    return metadata
 
 # Calculs mois
 def calculate_availability(
@@ -3846,6 +3945,40 @@ def render_exclusions_tab():
 
         now_ts = pd.Timestamp.now(tz='UTC')
         applied_ts = pd.to_datetime(df_active["applied_at"], errors="coerce", utc=True)
+        metadata_lookup = _fetch_blocks_metadata(df_active[["table_name", "bloc_id"]])
+
+        def _format_new_status(value: Any) -> str:
+            if value is None or (isinstance(value, float) and pd.isna(value)):
+                return "—"
+            try:
+                return status_map[int(value)]
+            except (TypeError, ValueError, KeyError):
+                return str(value)
+
+        def _format_block_datetime(value: Any) -> str:
+            if value is None or (isinstance(value, float) and pd.isna(value)):
+                return "—"
+            ts = _ensure_paris_timestamp(value)
+            if ts is None:
+                ts = pd.to_datetime(value, errors="coerce")
+            if ts is None or pd.isna(ts):
+                return "—"
+            return ts.strftime("%Y-%m-%d %H:%M")
+
+        new_status_raw: List[Optional[Any]] = []
+        start_raw: List[Optional[Any]] = []
+        end_raw: List[Optional[Any]] = []
+
+        for row in df_active.itertuples():
+            meta = metadata_lookup.get((row.table_name, int(row.bloc_id)))
+            if meta:
+                new_status_raw.append(meta.get("status"))
+                start_raw.append(meta.get("date_debut"))
+                end_raw.append(meta.get("date_fin"))
+            else:
+                new_status_raw.append(None)
+                start_raw.append(None)
+                end_raw.append(None)
 
         df_active_display = pd.DataFrame(
             {
@@ -3854,6 +3987,9 @@ def render_exclusions_tab():
                 "Table": df_active["table_name"],
                 "Bloc": df_active["bloc_id"].astype(int),
                 "Statut initial": df_active["previous_status"].map(status_map).fillna("Inconnu"),
+                "Nouveau statut": [_format_new_status(value) for value in new_status_raw],
+                "Date début": [_format_block_datetime(value) for value in start_raw],
+                "Date fin": [_format_block_datetime(value) for value in end_raw],
                 "Commentaire": df_active["exclusion_comment"].fillna("—"),
                 "Appliquée par": df_active["applied_by"].fillna("—"),
                 "Appliquée le": applied_ts.map(_format_applied_at),
@@ -3876,8 +4012,19 @@ def render_exclusions_tab():
                 "Appliquée par": st.column_config.TextColumn(disabled=True),
                 "Appliquée le": st.column_config.TextColumn(disabled=True),
                 "Actif depuis": st.column_config.TextColumn(disabled=True),
+                "Nouveau statut": st.column_config.TextColumn(disabled=True),
+                "Date début": st.column_config.TextColumn(disabled=True),
+                "Date fin": st.column_config.TextColumn(disabled=True),
             },
-            disabled=["ID exclusion", "Table", "Bloc", "Statut initial"],
+            disabled=[
+                "ID exclusion",
+                "Table",
+                "Bloc",
+                "Statut initial",
+                "Nouveau statut",
+                "Date début",
+                "Date fin",
+            ],
             key="active_exclusions_editor",
         )
 
@@ -3895,6 +4042,9 @@ def render_exclusions_tab():
             selected_details = df_active[df_active["id"].isin(selected_ids)]
             with st.expander("Détails des exclusions sélectionnées", expanded=False):
                 for _, selected in selected_details.sort_values("applied_at", ascending=False).iterrows():
+                    meta = metadata_lookup.get(
+                        (selected["table_name"], int(selected["bloc_id"]))
+                    )
                     st.markdown(
                         f"**Bloc #{int(selected['bloc_id'])} · {selected['table_name']}**"
                     )
@@ -3902,9 +4052,12 @@ def render_exclusions_tab():
                         {
                             "ID": int(selected["id"]),
                             "Statut initial": status_map.get(int(selected.get("previous_status", -1)), "Inconnu"),
+                            "Nouveau statut": _format_new_status(meta.get("status") if meta else None),
                             "Commentaire": selected.get("exclusion_comment") or "—",
                             "Appliquée par": selected.get("applied_by") or "—",
                             "Appliquée le": _format_applied_at(selected.get("applied_at")),
+                            "Date début": _format_block_datetime(meta.get("date_debut") if meta else None),
+                            "Date fin": _format_block_datetime(meta.get("date_fin") if meta else None),
                         }
                     )
 
