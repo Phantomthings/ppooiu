@@ -811,7 +811,7 @@ def _load_blocks_equipment(site: str, equip: str, start_dt: datetime, end_dt: da
     b.bloc_id, b.source_table,
     b.site, b.equipement_id, b.type_equipement, b.date_debut, b.date_fin,
     b.est_disponible, b.cause, b.raw_point_count, b.processed_at, b.batch_id, b.hash_signature,
-    TIMESTAMPDIFF(MINUTE, b.date_debut, b.date_fin) AS duration_minutes,
+    TIMESTAMPDIFF(MINUTE, GREATEST(b.date_debut, :start), LEAST(b.date_fin, :end)) AS duration_minutes,
     COALESCE(e.previous_status, b.est_disponible) AS previous_status,
     CASE WHEN e.id IS NOT NULL THEN 1 ELSE 0 END AS is_excluded,
     e.id AS exclusion_id,
@@ -854,7 +854,7 @@ def _load_blocks_pdc(site: str, equip: str, start_dt: datetime, end_dt: datetime
       p.processed_at,
       p.batch_id,
       p.hash_signature,
-      TIMESTAMPDIFF(MINUTE, p.date_debut, p.date_fin) AS duration_minutes,
+      TIMESTAMPDIFF(MINUTE, GREATEST(p.date_debut, :start), LEAST(p.date_fin, :end)) AS duration_minutes,
       COALESCE(e.previous_status, p.est_disponible) AS previous_status,
       CASE WHEN e.id IS NOT NULL THEN 1 ELSE 0 END AS is_excluded,
       e.id AS exclusion_id,
@@ -898,7 +898,8 @@ def _load_filtered_blocks_equipment(start_dt: datetime, end_dt: datetime, site: 
         """
         df = execute_query(q_view, params)
         if not df.empty:
-            return _normalize_blocks_df(df)
+            normalized = _normalize_blocks_df(df)
+            return _clip_block_durations(normalized, start_dt, end_dt)
     except DatabaseError:
         pass
 
@@ -935,7 +936,7 @@ def _load_filtered_blocks_equipment(start_dt: datetime, end_dt: datetime, site: 
     b.bloc_id, b.source_table,
     b.site, b.equipement_id, b.type_equipement, b.date_debut, b.date_fin,
     b.est_disponible, b.cause, b.raw_point_count, b.processed_at, b.batch_id, b.hash_signature,
-    TIMESTAMPDIFF(MINUTE, b.date_debut, b.date_fin) AS duration_minutes,
+    TIMESTAMPDIFF(MINUTE, GREATEST(b.date_debut, :start), LEAST(b.date_fin, :end)) AS duration_minutes,
     COALESCE(e.previous_status, b.est_disponible) AS previous_status,
     CASE WHEN e.id IS NOT NULL THEN 1 ELSE 0 END AS is_excluded,
     e.id AS exclusion_id,
@@ -954,7 +955,8 @@ def _load_filtered_blocks_equipment(start_dt: datetime, end_dt: datetime, site: 
     """
 
     df = execute_query(q, params)
-    return _normalize_blocks_df(df)
+    normalized = _normalize_blocks_df(df)
+    return _clip_block_durations(normalized, start_dt, end_dt)
 
 
 def _load_filtered_blocks_pdc(start_dt: datetime, end_dt: datetime, site: Optional[str] = None, equip: Optional[str] = None) -> pd.DataFrame:
@@ -989,7 +991,7 @@ def _load_filtered_blocks_pdc(start_dt: datetime, end_dt: datetime, site: Option
       p.processed_at,
       p.batch_id,
       p.hash_signature,
-      TIMESTAMPDIFF(MINUTE, p.date_debut, p.date_fin) AS duration_minutes,
+      TIMESTAMPDIFF(MINUTE, GREATEST(p.date_debut, :start), LEAST(p.date_fin, :end)) AS duration_minutes,
       COALESCE(e.previous_status, p.est_disponible) AS previous_status,
       CASE WHEN e.id IS NOT NULL THEN 1 ELSE 0 END AS is_excluded,
       e.id AS exclusion_id,
@@ -1009,7 +1011,8 @@ def _load_filtered_blocks_pdc(start_dt: datetime, end_dt: datetime, site: Option
     """
 
     df = execute_query(q, params)
-    return _normalize_blocks_df(df)
+    normalized = _normalize_blocks_df(df)
+    return _clip_block_durations(normalized, start_dt, end_dt)
 
 
 def load_filtered_blocks(start_dt: datetime, end_dt: datetime, site: Optional[str] = None, equip: Optional[str] = None, mode: Optional[str] = None) -> pd.DataFrame:
@@ -1446,6 +1449,36 @@ def _normalize_blocks_df(df: pd.DataFrame) -> pd.DataFrame:
         if text_col in out.columns:
             out[text_col] = out[text_col].fillna("").astype(str)
     return out.sort_values("date_debut").reset_index(drop=True)
+
+
+def _clip_block_durations(
+    df: pd.DataFrame,
+    start_dt: datetime,
+    end_dt: datetime,
+) -> pd.DataFrame:
+    """Ajuste les durées pour ne conserver que l'intervalle analysé."""
+
+    if df is None or df.empty:
+        return df if df is not None else pd.DataFrame()
+
+    start_ts = _ensure_paris_timestamp(start_dt)
+    end_ts = _ensure_paris_timestamp(end_dt)
+
+    if start_ts is None or end_ts is None:
+        return df
+
+    clipped = df.copy()
+    clip_start = clipped["date_debut"].clip(lower=start_ts)
+    clip_end = clipped["date_fin"].clip(upper=end_ts)
+
+    duration = (
+        (clip_end - clip_start).dt.total_seconds() / 60
+    ).fillna(0)
+    duration = duration.clip(lower=0)
+
+    clipped["duration_minutes"] = duration.round().astype(int)
+
+    return clipped
 
 
 def _aggregate_monthly_availability(
