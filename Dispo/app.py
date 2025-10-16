@@ -15,6 +15,8 @@ import streamlit as st
 from sqlalchemy import create_engine, text, inspect, bindparam
 from sqlalchemy.exc import NoSuchTableError, SQLAlchemyError
 
+from export import SiteReport, generate_statistics_pdf
+
 
 class ExclusionError(RuntimeError):
     """Raised when an exclusion operation cannot be completed."""
@@ -4606,7 +4608,90 @@ def render_report_tab():
         site_label = "Tous les sites"
     equipments_available = sum(1 for detail in equipment_details.values() if detail.summary)
 
+    export_metrics: Dict[str, Any] = {}
+    export_summary_df = pd.DataFrame()
+    export_equipment_summary = pd.DataFrame()
+    export_pdc_summary = pd.DataFrame()
+    export_raw_blocks = pd.DataFrame()
+    export_error: Optional[str] = None
+
+    try:
+        stats = load_station_statistics(site_current, start_dt_current, end_dt_current)
+        export_metrics = stats.get("metrics", {}) or {}
+        export_summary_df = stats.get("summary_df", pd.DataFrame()).copy()
+    except Exception as exc:  # pragma: no cover - dépend de la base
+        logger.error("Impossible de charger les statistiques pour l'export: %s", exc)
+
+    try:
+        equipment_summary_df = get_equipment_summary(
+            start_dt_current,
+            end_dt_current,
+            site_current,
+            mode=mode,
+        )
+        if not equipment_summary_df.empty:
+            pdc_mask = equipment_summary_df["Équipement"].astype(str).str.upper().str.startswith("PDC")
+            export_pdc_summary = equipment_summary_df[pdc_mask].reset_index(drop=True)
+            export_equipment_summary = equipment_summary_df[~pdc_mask].reset_index(drop=True)
+        else:
+            export_equipment_summary = pd.DataFrame()
+            export_pdc_summary = pd.DataFrame()
+    except Exception as exc:  # pragma: no cover - dépend de la base
+        logger.error("Impossible de charger le résumé équipements pour l'export: %s", exc)
+
+    try:
+        export_raw_blocks = load_filtered_blocks(
+            start_dt_current,
+            end_dt_current,
+            site_current,
+            None,
+            mode=mode,
+        )
+    except Exception as exc:  # pragma: no cover - dépend de la base
+        logger.error("Impossible de charger les blocs bruts pour l'export: %s", exc)
+
+    export_report = SiteReport(
+        site=site_current,
+        site_label=site_label,
+        metrics=export_metrics,
+        summary_df=export_summary_df,
+        equipment_summary=export_equipment_summary,
+        raw_blocks=export_raw_blocks,
+        pdc_summary=export_pdc_summary,
+    )
+
+    pdf_bytes: Optional[bytes] = None
+    if export_report:
+        try:
+            pdf_bytes = generate_statistics_pdf(
+                reports=[export_report],
+                start_dt=start_dt_current,
+                end_dt=end_dt_current,
+                title=f"Rapport de disponibilité – {site_label}",
+            )
+        except Exception as exc:  # pragma: no cover - génération PDF
+            logger.error("Erreur lors de la génération du PDF d'export: %s", exc)
+            pdf_bytes = None
+            export_error = f"génération du PDF : {exc}"
+
     st.markdown("---")
+
+    if pdf_bytes:
+        file_name = (
+            f"rapport_disponibilite_{site_current}_{start_dt_current.strftime('%Y%m%d')}_{end_dt_current.strftime('%Y%m%d')}.pdf"
+        )
+        st.download_button(
+            "💾 Télécharger le rapport PDF",
+            data=pdf_bytes,
+            file_name=file_name,
+            mime="application/pdf",
+            use_container_width=True,
+            help="Exporter l'ensemble du rapport en PDF",
+        )
+    elif export_error:
+        st.info(
+            "ℹ️ Export PDF indisponible actuellement (" + export_error + ")."
+        )
 
     col1, col2, col3 = st.columns([2, 1, 1])
     with col1:
