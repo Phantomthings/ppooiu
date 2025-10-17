@@ -169,25 +169,20 @@ def _ensure_timezone(ts: datetime) -> pd.Timestamp:
 
 def _prepare_metrics_cards(metrics: MetricDict) -> List[Dict[str, str]]:
     availability = float(metrics.get("availability_pct", 0.0) or 0.0)
+    downtime_minutes = int(metrics.get("downtime_minutes", 0) or 0)
     reference_minutes = int(metrics.get("reference_minutes", 0) or 0)
     coverage_pct = float(metrics.get("coverage_pct", 0.0) or 0.0)
     window_minutes = int(metrics.get("window_minutes", 0) or 0)
-    occurrences = int(metrics.get("downtime_occurrences", 0) or 0)
-
-    if occurrences == 1:
-        occurrences_label = "1 période"
-    else:
-        occurrences_label = f"{occurrences} périodes"
 
     cards = [
         {
-            "label": "Conditions critiques",
-            "value": occurrences_label,
+            "label": "Disponibilité estimée",
+            "value": f"{availability:.2f} %",
             "caption": "",
         },
         {
-            "label": "Disponibilité estimée",
-            "value": f"{availability:.2f}".replace(".", ",") + " %",
+            "label": "Indisponibilité réelle",
+            "value": _format_minutes(downtime_minutes),
             "caption": "",
         },
         {
@@ -543,7 +538,9 @@ def _prepare_pdc_rows(raw_blocks: pd.DataFrame) -> List[Dict[str, str]]:
     return rows
 
 
-def _pdc_table(rows: List[Dict[str, str]]) -> List[Any]:
+def _pdc_table(
+    rows: List[Dict[str, str]], table_title: Optional[str] = None
+) -> List[Any]:
     if not rows:
         return []
 
@@ -559,7 +556,7 @@ def _pdc_table(rows: List[Dict[str, str]]) -> List[Any]:
     ]
 
     data: List[List[Any]] = [
-        [Paragraph(title, STYLES["Heading4"]) for title in headers]
+        [Paragraph(header, STYLES["Heading4"]) for header in headers]
     ]
 
     for row in rows:
@@ -600,10 +597,10 @@ def _pdc_table(rows: List[Dict[str, str]]) -> List[Any]:
     )
 
     flow: List[Any] = []
-    if title:
-        flow.append(Paragraph(escape(title), STYLES["Heading4"]))
+    if table_title:
+        flow.append(Paragraph(escape(table_title), STYLES["Heading4"]))
         flow.append(Spacer(1, 0.15 * cm))
-
+                    
     flow.append(table)
     flow.append(Spacer(1, 0.3 * cm))
     return flow
@@ -646,7 +643,7 @@ def _prepare_translated_cause_rows(raw_blocks: pd.DataFrame) -> Dict[str, List[D
                     "Cause": str(record.cause) if record.cause else "Non spécifié",
                     "Cause traduite": str(record.translated) if record.translated else "Cause non spécifiée",
                     "Occurrences": str(int(record.occurrences)),
-                    "Durée (min)": _format_minutes(int(record.total)),
+                    "Durée (min)": _format_minutes(str(int(record.total))),
                 }
             )
 
