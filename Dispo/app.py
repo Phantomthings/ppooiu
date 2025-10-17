@@ -4533,6 +4533,7 @@ def _compute_pdf_metrics(
         "coverage_pct": float(coverage_pct),
         "window_minutes": total_window,
         "missing_minutes": missing_minutes,
+        "downtime_occurrences": 0,
     }
 
     summary_rows: List[Dict[str, Any]] = []
@@ -4567,6 +4568,7 @@ def _build_site_pdf_report(
     site: str,
     start_dt: datetime,
     end_dt: datetime,
+    statistics: Optional[Dict[str, Any]] = None,
 ) -> Optional[SiteReport]:
     equipment_summary = get_equipment_summary(
         start_dt, end_dt, site=site, mode=MODE_EQUIPMENT
@@ -4614,6 +4616,25 @@ def _build_site_pdf_report(
         combined_blocks, equipment_count, start_dt, end_dt
     )
 
+    if statistics:
+        stats_metrics = dict(statistics.get("metrics") or {})
+        stats_summary = statistics.get("summary_df")
+
+        if isinstance(stats_summary, pd.DataFrame):
+            summary_df = stats_summary.copy()
+        else:
+            summary_df = pd.DataFrame(
+                columns=["Condition", "Durée_Minutes", "Temps_Analysé_Minutes"]
+            )
+
+        for key, value in metrics.items():
+            stats_metrics.setdefault(key, value)
+
+        stats_metrics["downtime_occurrences"] = int(
+            stats_metrics.get("downtime_occurrences", 0) or 0
+        )
+        metrics = stats_metrics
+
     site_label = _resolve_site_label(site)
 
     return SiteReport(
@@ -4625,6 +4646,83 @@ def _build_site_pdf_report(
         raw_blocks=combined_blocks,
         pdc_summary=pdc_summary,
     )
+
+
+def _render_statistics_pdf_export(
+    site: str,
+    site_label: str,
+    stats: Dict[str, Any],
+    start_dt: datetime,
+    end_dt: datetime,
+) -> None:
+    export_state = st.session_state.setdefault("statistics_pdf_state", {})
+    site_state: Dict[str, Any] = export_state.setdefault(site, {})
+
+    context = (site, start_dt.isoformat(), end_dt.isoformat())
+    if site_state.get("context") != context:
+        site_state.clear()
+        site_state["context"] = context
+
+    default_title = f"Vue statistique – {site_label}"
+    title_key = f"{site}_stats_pdf_title"
+    context_key = f"{title_key}_ctx"
+
+    if st.session_state.get(context_key) != context:
+        st.session_state.pop(title_key, None)
+        st.session_state[context_key] = context
+
+    pdf_title = st.text_input(
+        "Titre du document",
+        value=site_state.get("title", default_title),
+        key=title_key,
+    )
+    site_state["title"] = pdf_title
+
+    generate_key = f"{site}_stats_pdf_generate"
+    download_key = f"{site}_stats_pdf_download"
+
+    if st.button("📄 Générer le PDF", key=generate_key):
+        try:
+            with st.spinner("📦 Génération du PDF en cours..."):
+                site_report = _build_site_pdf_report(
+                    site,
+                    start_dt,
+                    end_dt,
+                    statistics=stats,
+                )
+                if site_report is None:
+                    raise ValueError("Aucune donnée à exporter")
+                final_title = pdf_title.strip() or default_title
+                pdf_bytes = generate_statistics_pdf(
+                    [site_report],
+                    start_dt,
+                    end_dt,
+                    title=final_title,
+                )
+            file_name = (
+                f"vue_statistique_{site}_{start_dt:%Y%m%d}_{end_dt:%Y%m%d}.pdf"
+            ).replace(" ", "_")
+            site_state["bytes"] = pdf_bytes
+            site_state["filename"] = file_name
+            site_state["title"] = final_title
+            st.session_state[title_key] = final_title
+            st.success(
+                "✅ Rapport PDF généré avec succès. Utilisez le bouton ci-dessous pour le télécharger."
+            )
+        except ValueError as exc:
+            st.warning(f"⚠️ {exc}")
+        except Exception as exc:  # pragma: no cover - affichage utilisateur
+            logger.exception("Erreur lors de la génération du PDF statistique")
+            st.error(f"❌ Impossible de générer le rapport PDF : {exc}")
+
+    if site_state.get("bytes"):
+        st.download_button(
+            "⬇️ Télécharger le PDF",
+            data=site_state["bytes"],
+            file_name=site_state.get("filename", "vue_statistique.pdf"),
+            mime="application/pdf",
+            key=download_key,
+        )
 
 
 def _render_equipment_detail(detail: EquipmentReportDetail) -> None:
@@ -4822,66 +4920,6 @@ def render_report_tab():
         )
 
     st.caption(f"Durée totale analysée : {format_minutes(analysis_minutes)}")
-
-    export_context = (
-        site_current,
-        start_dt_current.isoformat() if start_dt_current else "",
-        end_dt_current.isoformat() if end_dt_current else "",
-    )
-    if st.session_state.get("report_pdf_context") != export_context:
-        st.session_state.pop("report_pdf_bytes", None)
-        st.session_state.pop("report_pdf_filename", None)
-        st.session_state.pop("report_pdf_saved_title", None)
-        st.session_state.pop("report_pdf_title_input", None)
-        st.session_state["report_pdf_context"] = export_context
-
-    st.markdown("---")
-    st.subheader("📤 Export du rapport")
-
-    default_pdf_title = f"Rapport de disponibilité – {site_label}"
-    saved_pdf_title = st.session_state.get("report_pdf_saved_title")
-    if "report_pdf_title_input" not in st.session_state:
-        st.session_state["report_pdf_title_input"] = saved_pdf_title or default_pdf_title
-
-    pdf_title = st.text_input(
-        "Titre du document",
-        key="report_pdf_title_input",
-    )
-
-    generate_pdf = st.button("📄 Générer le PDF", key="report_pdf_generate")
-    if generate_pdf:
-        try:
-            with st.spinner("📦 Génération du PDF en cours..."):
-                site_report = _build_site_pdf_report(
-                    site_current, start_dt_current, end_dt_current
-                )
-                if site_report is None:
-                    raise ValueError("Aucune donnée à exporter")
-                final_title = pdf_title.strip() or default_pdf_title
-                pdf_bytes = generate_statistics_pdf(
-                    [site_report], start_dt_current, end_dt_current, title=final_title
-                )
-            file_name = (
-                f"rapport_{site_current}_{start_dt_current:%Y%m%d}_{end_dt_current:%Y%m%d}.pdf"
-            ).replace(" ", "_")
-            st.session_state["report_pdf_bytes"] = pdf_bytes
-            st.session_state["report_pdf_filename"] = file_name
-            st.session_state["report_pdf_saved_title"] = final_title
-            st.success("✅ Rapport PDF généré avec succès. Utilisez le bouton ci-dessous pour le télécharger.")
-        except ValueError as exc:
-            st.warning(f"⚠️ {exc}")
-        except Exception as exc:  # pragma: no cover - affichage utilisateur
-            logger.exception("Erreur lors de la génération du PDF")
-            st.error(f"❌ Impossible de générer le rapport PDF : {exc}")
-
-    if st.session_state.get("report_pdf_bytes"):
-        st.download_button(
-            "⬇️ Télécharger le PDF",
-            data=st.session_state["report_pdf_bytes"],
-            file_name=st.session_state.get("report_pdf_filename", "rapport.pdf"),
-            mime="application/pdf",
-            key="report_pdf_download",
-        )
 
     st.markdown("**📈 Vue d'ensemble des équipements :**")
     if not overview_df.empty:
@@ -5294,6 +5332,9 @@ def render_statistics_tab() -> None:
 
         if window_minutes > 0 and coverage_pct < 80:
             st.warning("Couverture partielle des données : certaines périodes n'ont pas pu être analysées.")
+
+        st.markdown("**📤 Export PDF de la vue statistique**")
+        _render_statistics_pdf_export(site, site_label, stats, start_dt, end_dt)
 
         if not summary_df.empty:
             display_df = summary_df.copy()
