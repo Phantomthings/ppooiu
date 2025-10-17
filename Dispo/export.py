@@ -543,7 +543,9 @@ def _prepare_pdc_rows(raw_blocks: pd.DataFrame) -> List[Dict[str, str]]:
     return rows
 
 
-def _pdc_table(rows: List[Dict[str, str]]) -> List[Any]:
+def _pdc_table(
+    rows: List[Dict[str, str]], table_title: Optional[str] = None
+) -> List[Any]:
     if not rows:
         return []
 
@@ -559,7 +561,7 @@ def _pdc_table(rows: List[Dict[str, str]]) -> List[Any]:
     ]
 
     data: List[List[Any]] = [
-        [Paragraph(title, STYLES["Heading4"]) for title in headers]
+        [Paragraph(header, STYLES["Heading4"]) for header in headers]
     ]
 
     for row in rows:
@@ -600,8 +602,8 @@ def _pdc_table(rows: List[Dict[str, str]]) -> List[Any]:
     )
 
     flow: List[Any] = []
-    if title:
-        flow.append(Paragraph(escape(title), STYLES["Heading4"]))
+    if table_title:
+        flow.append(Paragraph(escape(table_title), STYLES["Heading4"]))
         flow.append(Spacer(1, 0.15 * cm))
 
     flow.append(table)
