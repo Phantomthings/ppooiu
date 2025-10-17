@@ -36,6 +36,7 @@ class ExclusionActionResult:
 _TABLE_NAME_PATTERN = re.compile(r"^[A-Za-z0-9_]+$")
 from Projects import mapping_sites
 from Binaire import get_equip_config, translate_ic_pc
+from export import SiteReport, generate_statistics_pdf
 
 # Config
 logging.basicConfig(
@@ -4457,6 +4458,175 @@ def _prepare_report_summary(
     return overview_df, equipment_details, totals
 
 
+def _resolve_site_label(site: str) -> str:
+    site_suffix = site.split("_")[-1] if site else ""
+    site_name = mapping_sites.get(site_suffix)
+    return f"{site} – {site_name}" if site_name else site
+
+
+def _filter_pdc_summary_for_pdf(summary: Optional[pd.DataFrame]) -> pd.DataFrame:
+    columns = [
+        "Équipement",
+        "Disponibilité Brute (%)",
+        "Disponibilité Avec Exclusions (%)",
+        "Durée Totale",
+        "Temps Disponible",
+        "Temps Indisponible",
+        "Jours avec des données",
+    ]
+    if summary is None or summary.empty:
+        return pd.DataFrame(columns=columns)
+
+    df = summary.copy()
+    df["Équipement"] = df["Équipement"].astype(str)
+    mask = df["Équipement"].str.upper().str.startswith("PDC")
+    filtered = df.loc[mask].reset_index(drop=True)
+    if filtered.empty:
+        return pd.DataFrame(columns=columns)
+    return filtered
+
+
+def _compute_pdf_metrics(
+    combined_blocks: pd.DataFrame,
+    equipment_count: int,
+    start_dt: datetime,
+    end_dt: datetime,
+) -> Tuple[Dict[str, Any], pd.DataFrame]:
+    window_minutes = int((end_dt - start_dt).total_seconds() // 60)
+    total_window = window_minutes * max(equipment_count, 1)
+
+    if combined_blocks is None or combined_blocks.empty:
+        metrics = {
+            "availability_pct": 0.0,
+            "downtime_minutes": 0,
+            "reference_minutes": 0,
+            "coverage_pct": 0.0,
+            "window_minutes": total_window,
+            "missing_minutes": 0,
+        }
+        summary_df = pd.DataFrame(
+            columns=["Condition", "Durée_Minutes", "Temps_Analysé_Minutes"]
+        )
+        return metrics, summary_df
+
+    stats_with_exclusions = calculate_availability(
+        combined_blocks, include_exclusions=True
+    )
+    stats_raw = calculate_availability(combined_blocks, include_exclusions=False)
+
+    reference_minutes = int(stats_with_exclusions.get("effective_minutes", 0) or 0)
+    downtime_minutes = int(stats_with_exclusions.get("unavailable_minutes", 0) or 0)
+    missing_minutes = int(stats_raw.get("missing_minutes", 0) or 0)
+
+    coverage_pct = (
+        (reference_minutes / total_window * 100)
+        if total_window and reference_minutes
+        else 0.0
+    )
+
+    metrics: Dict[str, Any] = {
+        "availability_pct": float(
+            stats_with_exclusions.get("pct_available", 0.0) or 0.0
+        ),
+        "downtime_minutes": downtime_minutes,
+        "reference_minutes": reference_minutes,
+        "coverage_pct": float(coverage_pct),
+        "window_minutes": total_window,
+        "missing_minutes": missing_minutes,
+    }
+
+    summary_rows: List[Dict[str, Any]] = []
+    if downtime_minutes:
+        summary_rows.append(
+            {
+                "Condition": "Indisponibilités mesurées",
+                "Durée_Minutes": downtime_minutes,
+                "Temps_Analysé_Minutes": reference_minutes,
+            }
+        )
+    if missing_minutes:
+        summary_rows.append(
+            {
+                "Condition": "Données manquantes",
+                "Durée_Minutes": missing_minutes,
+                "Temps_Analysé_Minutes": total_window,
+            }
+        )
+
+    summary_df = (
+        pd.DataFrame(summary_rows)
+        if summary_rows
+        else pd.DataFrame(
+            columns=["Condition", "Durée_Minutes", "Temps_Analysé_Minutes"]
+        )
+    )
+    return metrics, summary_df
+
+
+def _build_site_pdf_report(
+    site: str,
+    start_dt: datetime,
+    end_dt: datetime,
+) -> Optional[SiteReport]:
+    equipment_summary = get_equipment_summary(
+        start_dt, end_dt, site=site, mode=MODE_EQUIPMENT
+    )
+    pdc_summary = _filter_pdc_summary_for_pdf(
+        get_equipment_summary(start_dt, end_dt, site=site, mode=MODE_PDC)
+    )
+
+    try:
+        equipment_blocks = load_filtered_blocks(
+            start_dt, end_dt, site, None, mode=MODE_EQUIPMENT
+        )
+    except Exception:
+        equipment_blocks = pd.DataFrame()
+
+    try:
+        pdc_blocks = load_filtered_blocks(
+            start_dt, end_dt, site, None, mode=MODE_PDC
+        )
+    except Exception:
+        pdc_blocks = pd.DataFrame()
+
+    frames: List[pd.DataFrame] = []
+    for df in (equipment_blocks, pdc_blocks):
+        if df is not None and not df.empty:
+            frames.append(df.copy())
+
+    if frames:
+        combined_blocks = pd.concat(frames, ignore_index=True)
+    else:
+        combined_blocks = pd.DataFrame(
+            columns=["equipement_id", "duration_minutes", "est_disponible", "cause"]
+        )
+
+    if not combined_blocks.empty and "equipement_id" in combined_blocks.columns:
+        equipment_count = combined_blocks["equipement_id"].astype(str).nunique()
+    else:
+        equipment_count = 0
+        if not equipment_summary.empty:
+            equipment_count += equipment_summary["Équipement"].astype(str).nunique()
+        if not pdc_summary.empty:
+            equipment_count += pdc_summary["Équipement"].astype(str).nunique()
+
+    metrics, summary_df = _compute_pdf_metrics(
+        combined_blocks, equipment_count, start_dt, end_dt
+    )
+
+    site_label = _resolve_site_label(site)
+
+    return SiteReport(
+        site=site,
+        site_label=site_label,
+        metrics=metrics,
+        summary_df=summary_df,
+        equipment_summary=equipment_summary,
+        raw_blocks=combined_blocks,
+        pdc_summary=pdc_summary,
+    )
+
+
 def _render_equipment_detail(detail: EquipmentReportDetail) -> None:
     """Affiche la section détaillée d'un équipement."""
 
@@ -4652,6 +4822,60 @@ def render_report_tab():
         )
 
     st.caption(f"Durée totale analysée : {format_minutes(analysis_minutes)}")
+
+    export_context = (
+        site_current,
+        start_dt_current.isoformat() if start_dt_current else "",
+        end_dt_current.isoformat() if end_dt_current else "",
+    )
+    if st.session_state.get("report_pdf_context") != export_context:
+        st.session_state.pop("report_pdf_bytes", None)
+        st.session_state.pop("report_pdf_filename", None)
+        st.session_state.pop("report_pdf_title", None)
+        st.session_state["report_pdf_context"] = export_context
+
+    st.markdown("---")
+    st.subheader("📤 Export du rapport")
+
+    default_pdf_title = f"Rapport de disponibilité – {site_label}"
+    pdf_title = st.text_input(
+        "Titre du document", default_pdf_title, key="report_pdf_title"
+    )
+
+    generate_pdf = st.button("📄 Générer le PDF", key="report_pdf_generate")
+    if generate_pdf:
+        try:
+            with st.spinner("📦 Génération du PDF en cours..."):
+                site_report = _build_site_pdf_report(
+                    site_current, start_dt_current, end_dt_current
+                )
+                if site_report is None:
+                    raise ValueError("Aucune donnée à exporter")
+                final_title = pdf_title.strip() or default_pdf_title
+                pdf_bytes = generate_statistics_pdf(
+                    [site_report], start_dt_current, end_dt_current, title=final_title
+                )
+            file_name = (
+                f"rapport_{site_current}_{start_dt_current:%Y%m%d}_{end_dt_current:%Y%m%d}.pdf"
+            ).replace(" ", "_")
+            st.session_state["report_pdf_bytes"] = pdf_bytes
+            st.session_state["report_pdf_filename"] = file_name
+            st.session_state["report_pdf_title"] = final_title
+            st.success("✅ Rapport PDF généré avec succès. Utilisez le bouton ci-dessous pour le télécharger.")
+        except ValueError as exc:
+            st.warning(f"⚠️ {exc}")
+        except Exception as exc:  # pragma: no cover - affichage utilisateur
+            logger.exception("Erreur lors de la génération du PDF")
+            st.error(f"❌ Impossible de générer le rapport PDF : {exc}")
+
+    if st.session_state.get("report_pdf_bytes"):
+        st.download_button(
+            "⬇️ Télécharger le PDF",
+            data=st.session_state["report_pdf_bytes"],
+            file_name=st.session_state.get("report_pdf_filename", "rapport.pdf"),
+            mime="application/pdf",
+            key="report_pdf_download",
+        )
 
     st.markdown("**📈 Vue d'ensemble des équipements :**")
     if not overview_df.empty:

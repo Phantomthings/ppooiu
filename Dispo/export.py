@@ -641,7 +641,7 @@ def _prepare_translated_cause_rows(raw_blocks: pd.DataFrame) -> Dict[str, List[D
                     "Cause": str(record.cause) if record.cause else "Non spécifié",
                     "Cause traduite": str(record.translated) if record.translated else "Cause non spécifiée",
                     "Occurrences": str(int(record.occurrences)),
-                    "Durée (min)": _format_minutes(str(int(record.total))),
+                    "Durée (min)": _format_minutes(int(record.total)),
                 }
             )
 
