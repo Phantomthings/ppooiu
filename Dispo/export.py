@@ -169,20 +169,25 @@ def _ensure_timezone(ts: datetime) -> pd.Timestamp:
 
 def _prepare_metrics_cards(metrics: MetricDict) -> List[Dict[str, str]]:
     availability = float(metrics.get("availability_pct", 0.0) or 0.0)
-    downtime_minutes = int(metrics.get("downtime_minutes", 0) or 0)
     reference_minutes = int(metrics.get("reference_minutes", 0) or 0)
     coverage_pct = float(metrics.get("coverage_pct", 0.0) or 0.0)
     window_minutes = int(metrics.get("window_minutes", 0) or 0)
+    occurrences = int(metrics.get("downtime_occurrences", 0) or 0)
+
+    if occurrences == 1:
+        occurrences_label = "1 période"
+    else:
+        occurrences_label = f"{occurrences} périodes"
 
     cards = [
         {
-            "label": "Disponibilité estimée",
-            "value": f"{availability:.2f} %",
+            "label": "Conditions critiques",
+            "value": occurrences_label,
             "caption": "",
         },
         {
-            "label": "Indisponibilité réelle",
-            "value": _format_minutes(downtime_minutes),
+            "label": "Disponibilité estimée",
+            "value": f"{availability:.2f}".replace(".", ",") + " %",
             "caption": "",
         },
         {
