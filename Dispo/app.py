@@ -4831,15 +4831,21 @@ def render_report_tab():
     if st.session_state.get("report_pdf_context") != export_context:
         st.session_state.pop("report_pdf_bytes", None)
         st.session_state.pop("report_pdf_filename", None)
-        st.session_state.pop("report_pdf_title", None)
+        st.session_state.pop("report_pdf_saved_title", None)
+        st.session_state.pop("report_pdf_title_input", None)
         st.session_state["report_pdf_context"] = export_context
 
     st.markdown("---")
     st.subheader("📤 Export du rapport")
 
     default_pdf_title = f"Rapport de disponibilité – {site_label}"
+    saved_pdf_title = st.session_state.get("report_pdf_saved_title")
+    if "report_pdf_title_input" not in st.session_state:
+        st.session_state["report_pdf_title_input"] = saved_pdf_title or default_pdf_title
+
     pdf_title = st.text_input(
-        "Titre du document", default_pdf_title, key="report_pdf_title"
+        "Titre du document",
+        key="report_pdf_title_input",
     )
 
     generate_pdf = st.button("📄 Générer le PDF", key="report_pdf_generate")
@@ -4860,7 +4866,7 @@ def render_report_tab():
             ).replace(" ", "_")
             st.session_state["report_pdf_bytes"] = pdf_bytes
             st.session_state["report_pdf_filename"] = file_name
-            st.session_state["report_pdf_title"] = final_title
+            st.session_state["report_pdf_saved_title"] = final_title
             st.success("✅ Rapport PDF généré avec succès. Utilisez le bouton ci-dessous pour le télécharger.")
         except ValueError as exc:
             st.warning(f"⚠️ {exc}")
